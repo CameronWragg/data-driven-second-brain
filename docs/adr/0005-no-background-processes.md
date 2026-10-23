@@ -1,0 +1,3 @@
+# The Second Brain does nothing unless an Agent is connected
+
+The Second Brain runs only as an MCP server launched by an Agent session: no daemons, file watchers, idle timers or scheduled syncs. Rescans happen on startup when manifests have changed or on an explicit `scan`; commits happen per `write` call; pushes happen on an explicit `push`, on shutdown, and again on the next startup in case the shutdown push never ran. We accept that changes made between sessions (hand edits, upstream merges, unpushed commits) are only picked up when the next session starts, in exchange for a tool that consumes nothing while idle.
