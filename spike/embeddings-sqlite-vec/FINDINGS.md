@@ -68,3 +68,27 @@ The on-disk size includes an uncheckpointed WAL from the single bulk transaction
 4. **Performance budgets** (fog) now have a baseline: a 30 MB binary, about 250–550 ms to a ready model, a hybrid query p95 of about 26–51 ms at 10k rows, and 150–400 MB RSS per `serve`.
 5. **Per-`serve` memory** is an input to [Decide the sync and shutdown model](https://github.com/CameronWragg/data-driven-second-brain/issues/31), since every Agent connection spawns its own process with its own model.
 6. **Dev environment:** a clean fat-LTO release build takes about 3 minutes. Day-to-day builds should use the dev profile or thin LTO.
+
+## Addendum: first-party files and batching
+
+Asked after resolution: can we avoid third-party conversions, and get batching?
+
+**First-party ONNX availability (Hugging Face, 2026-10-25):**
+- `BAAI/bge-small-en-v1.5` publishes **only fp32**, as `onnx/model.onnx` (133 MB, revision `5c38ec7c`, LFS `828e1496…`). It is byte-identical to Xenova's fp32 file. There is no first-party int8.
+- `nomic-ai/nomic-embed-text-v1.5` hosts fp32 (547 MB), fp16, int8/quantized (137 MB), uint8, q4, q4f16 and bnb4 in its own repo. They were contributed by Xenova and merged by Nomic, in PRs #3 and #39.
+- `google/embeddinggemma-300m` has **no ONNX** (and is gated). The only ONNX is `onnx-community/embeddinggemma-300m-ONNX`, which is Hugging Face's org, not Google's.
+
+**Realistic reindex** (`batch` subcommand): 128 Recollections of 20–300 words, mean 60 words. "Sorted" means batched by length to cut padding.
+
+| Model | Single | Batch 8 unsorted | **Batch 8 sorted** | Batch 32 sorted | cos(batched, single) | cos(vs fp32) |
+|---|---|---|---|---|---|---|
+| bge fp32 (BAAI) | 20.1/s | 17.1/s | **25.2/s** | 22.3/s | 1.00000 (bit-stable) | — |
+| bge int8 (Xenova), guard bypassed | 32.4/s | 30.0/s | 45.7/s | 37.5/s | min 0.9937, mean 0.9965 | mean 0.9964, min 0.9936 |
+| nomic fp32 (Nomic) | 5.2/s | 3.5/s | 5.2/s | 4.6/s | 1.00000 | — |
+| nomic int8 (Nomic), guard bypassed | 9.5/s | 6.8/s | 10.4/s | 8.8/s | min 0.967, mean 0.983 | mean 0.959, min 0.947 |
+
+- **Batching gains little on this CPU.** ONNX Runtime already spreads a single item across the intra-op threads. Length-sorted batch 8 is the best setting, at +25% for bge fp32 and +40% for bge int8. **Unsorted batching is slower than embedding one text at a time**, because of padding. Batch 32 is worse than batch 8.
+- **fastembed's guard is justified.** With dynamic quantisation, a batched vector differs from the single vector of the same text (cos about 0.996 for bge, 0.98 for nomic). That is as large as the whole int8-to-fp32 gap, so whether two Recollections look like duplicates would depend on which batch they were embedded in. Dynamic-quant models must stay one at a time.
+- **nomic int8 is lossy:** cos 0.959 to its own fp32. bge int8 loses much less (0.996).
+- **nomic fp32 is heavy:** 1.19 s from start to first embedding, a 54 ms query p50 and **1.43 GB peak RSS**.
+- **bge fp32 from BAAI** gives deterministic, batchable vectors from first-party weights at 133 MB, a 16 ms query, 346 MB RSS and about 25 docs/s for 60-word docs (roughly 40 s per 1,000 Recollections).

@@ -58,6 +58,7 @@ fn main() {
             args.get(3).map(|s| s.parse().unwrap()).unwrap_or(10_000),
         ),
         Some("writers") => writers(),
+        Some("batch") => batch(Path::new(&args[2]), args.get(3).map(Path::new)),
         Some("write-proc") => write_proc(args[2].parse().unwrap()),
         _ => eprintln!("usage: embed <dir> | hybrid <dir> [n] | writers"),
     }
@@ -86,7 +87,7 @@ fn load(dir: &Path) -> Model {
     };
     let nomic = dir.to_string_lossy().contains("nomic");
     let (pooling, quant, qp, dp, dim) = if nomic {
-        (Pooling::Mean, QuantizationMode::Dynamic, "search_query: ", "search_document: ", 768)
+        (Pooling::Mean, if dir.to_string_lossy().contains("fp32") { QuantizationMode::None } else { QuantizationMode::Dynamic }, "search_query: ", "search_document: ", 768)
     } else {
         let quant = if dir.to_string_lossy().contains("fp32") {
             QuantizationMode::None
@@ -97,9 +98,12 @@ fn load(dir: &Path) -> Model {
         };
         (Pooling::Cls, quant, "Represent this sentence for searching relevant passages: ", "", 384)
     };
+    // FORCE_BATCH=1 lies to fastembed about dynamic quant to bypass its guard,
+    // so the batch-vs-single drift can be measured.
+    let declared = if std::env::var("FORCE_BATCH").is_ok() { QuantizationMode::None } else { quant };
     let model = UserDefinedEmbeddingModel::new(fs::read(onnx).unwrap(), tok)
         .with_pooling(pooling)
-        .with_quantization(quant);
+        .with_quantization(declared);
     let mut opts = InitOptionsUserDefined::default();
     opts.intra_threads = std::env::var("THREADS").ok().map(|t| t.parse().unwrap());
     let te = TextEmbedding::try_new_from_user_defined(model, opts).unwrap();
@@ -400,4 +404,62 @@ fn write_proc(w: i64) {
         }
     }
     println!("proc {w}: 500 writes in {:.0} ms, {busy} busy errors", ms(t));
+}
+
+fn cos(a: &[f32], b: &[f32]) -> f32 {
+    let d: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    d / (a.iter().map(|x| x * x).sum::<f32>().sqrt() * b.iter().map(|x| x * x).sum::<f32>().sqrt())
+}
+
+/// Realistic reindex: 128 Recollections of 20–300 words. Compares one-at-a-time
+/// against batching (unsorted and length-sorted), reports throughput and the
+/// cosine drift between batched and single vectors. With a reference model
+/// dir, also reports agreement with that model's single vectors.
+fn batch(dir: &Path, reference: Option<&Path>) {
+    let mut m = load(dir);
+    let mut rng = Rng(42);
+    let docs: Vec<String> = (0..128)
+        .map(|_| {
+            let n = 1 + (rng.next() % 6) as usize;
+            let body = (0..n)
+                .map(|_| RECOLLECTIONS[(rng.next() % RECOLLECTIONS.len() as u64) as usize].3)
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{}{body}", m.doc_prefix)
+        })
+        .collect();
+    let words: usize = docs.iter().map(|d| d.split_whitespace().count()).sum();
+    println!("{} docs, mean {} words", docs.len(), words / docs.len());
+
+    let t = Instant::now();
+    let single: Vec<Vec<f32>> = docs.iter().map(|d| m.te.embed(vec![d], None).unwrap().remove(0)).collect();
+    println!("  single           {:6.1} docs/s", 128.0 / t.elapsed().as_secs_f64());
+
+    let mut order: Vec<usize> = (0..docs.len()).collect();
+    order.sort_by_key(|&i| docs[i].len());
+    for bs in [8usize, 32] {
+        for sorted in [false, true] {
+            let idx: Vec<usize> = if sorted { order.clone() } else { (0..docs.len()).collect() };
+            let input: Vec<&String> = idx.iter().map(|&i| &docs[i]).collect();
+            let t = Instant::now();
+            let out = match m.te.embed(&input, Some(bs)) {
+                Ok(o) => o,
+                Err(e) => { println!("  batch {bs}: {e}"); return; }
+            };
+            let rate = 128.0 / t.elapsed().as_secs_f64();
+            let drift: Vec<f32> = idx.iter().zip(&out).map(|(&i, v)| cos(&single[i], v)).collect();
+            let min = drift.iter().cloned().fold(1.0, f32::min);
+            let mean = drift.iter().sum::<f32>() / drift.len() as f32;
+            println!("  batch {bs:2} {}  {rate:6.1} docs/s   cos(batched, single) min {min:.5} mean {mean:.5}",
+                if sorted { "sorted  " } else { "unsorted" });
+        }
+    }
+
+    if let Some(r) = reference {
+        let mut rm = load(r);
+        let refv: Vec<Vec<f32>> = docs.iter().map(|d| rm.te.embed(vec![d], None).unwrap().remove(0)).collect();
+        let agree: Vec<f32> = single.iter().zip(&refv).map(|(a, b)| cos(a, b)).collect();
+        println!("  vs {}: cos min {:.4} mean {:.4}", r.display(),
+            agree.iter().cloned().fold(1.0, f32::min), agree.iter().sum::<f32>() / agree.len() as f32);
+    }
 }
