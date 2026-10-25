@@ -19,7 +19,7 @@ There is one binary (provisional name `brain`) with these subcommands:
 | `brain reindex` | Delete and rebuild the index from files |
 | `brain eval` | Run the retrieval test set (§13) |
 
-`serve` does work only while an Agent is connected.
+`serve` does work only while an Agent is connected. It answers the MCP handshake (`initialize`, `tools/list`) at once and runs the startup sequence alongside it: Claude Code waits at most 5 s for the tools of a server that marks tools `anthropic/alwaysLoad` (§14.3). A tool call that arrives before the startup sequence finishes waits for it, up to a timeout, then returns `busy`.
 
 **Startup sequence (`serve`):**
 1. Open the index (SQLite, WAL mode).
@@ -155,26 +155,64 @@ A Link is stored in the front-matter of the file it starts from. Initial Link ty
 | `depends-on` | Repository → Repository or Dependency (carries `version`) |
 | `calls` | Repository → Repository |
 
+A Link derived by the scanner carries `by: scanner`. The scanner adds and removes only its own Links, and an Agent cannot `unlink` one (it changes the manifest instead). Agents may declare Links of any type.
+
 Forks (`forked_from`), Components and Branches are structural fields, not Links. Links are unweighted facts. **Similarity** is computed at query time and never stored as a Link.
 
 ## 5. Writing
 
-All changes go through the `write` tool as a **batch**. A batch is atomic: every operation is validated first, and if any operation fails, nothing is written.
+All changes go through the `write` tool as a **batch** of operations. A batch is atomic: every operation is validated first, and if any operation fails, nothing is written.
 
-**Operations:** `create`, `update`, `supersede` (create a replacement, record `supersedes`, delete the old Recollection), `delete`, `link`, `unlink`, `update_entity`.
+### 5.1 Operations
 
-**Checks, in order:**
-1. **Schema:** required fields are present and the Kind's required sections exist.
-2. **Secrets:** a pattern- and entropy-based detector (API keys, tokens, private keys, credentials in URLs). A match rejects the whole batch with an explanation.
-3. **Duplicates** (on `create` only): the brain looks for existing Recollections that share an Entity or Anchor *and* have Similarity above a threshold. If any match, the batch is rejected and the candidates returned, unless the operation sets `distinct: true`.
+| Operation | Fields | Notes |
+|---|---|---|
+| `create` | `kind`, `title`, `summary`, `body`, `links`; optional `tags`, `anchors`, `applies_to`, `ref`, `distinct` | `links` must hold at least one `about` Link |
+| `update` | `id`, `version`; any of `title`, `summary`, `body`, `kind`, `tags`, `links`, `anchors`, `applies_to` | Patches the fields given. `body` and lists are replaced whole |
+| `supersede` | `id`, `version`, `replacement` (the `create` fields) | Creates the replacement, records `supersedes`, deletes the old Recollection |
+| `delete` | `id`, `version` | |
+| `link` / `unlink` | `from`, `type`, `to`, `from_version`; optional `version` (the `depends-on` version) | `from_version` is the concurrency version of the file the Link starts from |
+| `create_entity` | `id`, `name`, optional `description`, `docs`, `ref` | For Entities the scanner doesn't make: a `calls` target not checked out here, a Dependency outside §7.2 |
+| `update_entity` | `id`, `version`; any of `name`, `description`, `docs` | All other Entity fields belong to the server and scanner |
+| `set_branch_status` | `branch`, `outcome: merged \| closed`, optional `into` (defaults to the default branch) | Settles a Branch by hand (§9.1) |
 
-**Commit:** each successful batch is one commit, made under the write lock. The subject is generated, and the trailers look like:
+**Fields the server fills in.** Agents never send `id` (on `create`), `created`, `updated`, `state`, `abandoned_at`, `branch`, or an Anchor's `commit` and `hash`. `branch` is the current Branch of the detected Checkout; only an `update` made for a Promotion (§9.3) may re-target it. An Anchor takes `path`, `lines` and an optional `repository` (default: the current Repository); the server computes `commit` and `hash` from the Checkout. If the anchored lines have uncommitted changes, the Anchor records the working-tree text, the commit is HEAD, and it is marked `uncommitted: true` (§8).
+
+**References within a batch.** A `create` or `create_entity` may carry a local `ref` (e.g. `"a"`), and later operations in the same batch may name it as `ref:a`. The result maps each ref to its new ID.
+
+**Unknown IDs.** A `link` to an ID that doesn't exist is rejected; Entities are created explicitly with `create_entity`.
+
+**Optimistic concurrency.** Every Recollection and Entity has a `version`: a hash of its file's content, returned by `get`, `search`, `promotion` and `write`. Operations that change an existing file require the `version` the Agent last saw. If the file has changed since (a hand edit, another `serve`), the operation is rejected with code `conflict` and the current version.
+
+### 5.2 Checks
+
+Every check runs on every operation, and a rejection reports **all** problems at once, each with its operation index and check.
+
+1. **Schema:** required fields are present, the Kind's required sections exist, a `create` has an `about` Link, and every referenced ID exists.
+2. **Secrets:** a pattern- and entropy-based detector (API keys, tokens, private keys, credentials in URLs).
+3. **Concurrency:** each `version` matches the file on disk.
+4. **Duplicates** (on `create` and on a `supersede` replacement, for operations that passed the schema check): the brain looks for existing Recollections that share an Entity or Anchor *and* have Similarity above a threshold. It leaves out the Recollection being superseded and any the new one already Links with `relates-to`; such a Link counts as distinct.
+
+**A duplicate rejection** lists at most 3 candidates, ranked, without scores, each with its `id`, `kind`, `title`, `summary` and `version`, followed by the decision:
+
+| If the candidate is… | Then |
+|---|---|
+| the same knowledge | `update` or `supersede` it instead |
+| related but distinct | add a `relates-to` Link to it and retry |
+| unrelated | retry with `distinct` set to a short reason |
+
+`distinct` is a reason string, not a flag, and it is recorded in the commit as a `Distinct:` trailer so it can be audited.
+
+### 5.3 Commit
+
+Each successful batch is one commit, made under the write lock. The subject is generated, and the trailers look like:
 ```
 Recollection: 01JB3K…
 Recollection: 01JB3M…
 Repository: repo:github.com/cameronwragg/api
 Branch: feature/x
 Action: create, supersede
+Distinct: covers the v5 behaviour; 01HZX… covers v4
 Author: agent
 ```
 
@@ -216,10 +254,10 @@ The provider is a trait. The default implementation is a local ONNX model, chose
    - Entities Linked to it **directly** (one step away), and Recollections about them
    - on Branches, the current Branch plus the default branch
 
-   Recollections from other Branches are included only if the caller asks, and are labelled with their Branch. `scope: all` searches the whole brain.
+   Recollections from other Branches are included only if the caller asks (`branches`: a list of names, or `"all"`), and are labelled with their Branch. `scope` is `"current"` (the default), `"all"`, or a Repository ID. With no detected Checkout, `"current"` behaves as `"all"`, and the results say so.
 2. **Filters:** Kind, Entity, tags, and whether to include abandoned Recollections.
 3. **Ranking:** FTS5 and vector results are merged with reciprocal rank fusion.
-4. **Results:** `id`, `kind`, `title`, `summary`, `branch`, `stale` (`fresh` | `stale` | `unknown`), and `score`. The full body comes from `get`.
+4. **Results:** Recollections and Entities, ranked, each with `id`, `kind` (`repository` or `dependency` for Entities), `title`, `summary`, `version`, and `branch` and staleness only when they apply. Scores are not returned; the rank carries the order. The full body comes from `get`.
 
 ## 7. Scanner (the first Source)
 
@@ -251,11 +289,11 @@ Agents can add and fix entries.
 
 ### 7.4 Repository-to-Repository Links
 
-The scanner adds `depends-on` Links where a manifest points at a Repository the brain already knows about: a git dependency, a path dependency or a workspace member. Agents declare the rest, such as `calls`.
+The scanner adds `depends-on` Links (marked `by: scanner`, §4.5) where a manifest points at a Repository the brain already knows about: a git dependency, a path dependency or a workspace member. Agents declare the rest, such as `calls`.
 
 ## 8. Anchors and staleness
 
-When an Anchor is written, the brain stores its path, line range, commit and the hash of the normalised text in those lines.
+When an Anchor is written, the brain stores its path, line range, commit and the hash of the normalised text in those lines. If those lines have uncommitted changes, it hashes the working-tree text, records HEAD as the commit and marks the Anchor `uncommitted: true`; on read, such an Anchor skips step 2 and goes straight to the text search in step 3.
 
 On read, each Anchor is checked:
 1. **No local Checkout** of the Repository → `unknown`.
@@ -275,9 +313,7 @@ The brain only checks Branches that have Recollections on them.
    - **merged** → status `merged`, `into` = the PR's base branch
    - **closed** → status `closed`
 3. Otherwise, check whether the Branch's last known commit is an ancestor of the default branch. If it is, the Branch was merged into the default branch.
-4. If none of these settles it, the status is `unknown`, and `context` reports it so the Agent can resolve it with `status`.
-
-The `status` tool sets the outcome by hand: `merged` (with `into`, which defaults to the default branch) or `closed`.
+4. If none of these settles it, the status is `unknown`, and `context` reports it so the Agent can resolve it with a `set_branch_status` operation in `write` (§5.1): `merged` (with `into`, which defaults to the default branch) or `closed`.
 
 ### 9.2 Outcomes
 
@@ -326,14 +362,65 @@ Several `serve` processes can share one brain. `.index/lock` is an exclusive fil
 
 ## 14. MCP tools
 
-| Tool | Input (summary) | Output (summary) |
+### 14.1 Tools
+
+| Tool | Input | Output |
 |---|---|---|
-| `context` | — | Current Repository, Branch and Checkout; directly Linked Entities; pending Promotions; Branches with status `unknown`; count of stale Recollections; files needing repair; offline or sync problems |
-| `search` | `query`, `scope?`, `kinds?`, `entities?`, `tags?`, `branches?`, `include_abandoned?`, `limit?` | Summaries (§6.4) |
-| `get` | `ids[]` | Full Recollections or Entities, with per-Anchor staleness and docs URLs resolved for the installed version |
-| `write` | `operations[]` | Commit ID, or a rejection (schema, secret or duplicate, with candidates) |
-| `promotion` | `branch?` | A Promotion plan (§9.3) |
-| `status` | `branch`, `outcome: merged \| closed`, `into?` | Updated Branch status |
-| `scan` | — | Entities and Links added, changed or removed |
-| `history` | `id` | Past versions from git, found by `Recollection:` trailer, including superseded and deleted ones |
+| `context` | `path?` (re-detect the Checkout from this directory) | Current Repository, Branch and Checkout (or that there is none); directly Linked Entities; pending Promotions; Branches with status `unknown`; count of stale Recollections; files needing repair; offline or sync problems; then a one-line list of what needs doing |
+| `search` | `query`, `scope?`, `branches?`, `kinds?`, `entities?`, `tags?`, `include_abandoned?`, `limit?` | Ranked results (§6.4), one line each |
+| `get` | `ids[]` (Recollections or Entities) | Full items (§14.4) |
+| `write` | `operations[]` (§5.1) | Per-operation outcomes and the commit, or a rejection (§5.2) |
+| `promotion` | `branch?` (default: the oldest pending Promotion in the current Repository) | A Promotion plan (§9.3) as summaries |
+| `scan` | — | Counts of Entities and Links added, changed and removed, then up to 20 named changes and "+N more" |
+| `history` | `id`, `commit?` | Without `commit`: up to 20 commits for the item, newest first (short SHA, date, `Action`, `Author`, subject), found by trailer, including superseded and deleted items. With `commit`: the file as it was at that commit |
 | `push` | — | Push result |
+
+Tool names carry no prefix; clients add their own (Claude Code shows `mcp__brain__search`).
+
+### 14.2 Output format
+
+Every tool returns compact Markdown text, which is what the model reads. The core returns typed values and the MCP layer renders them; v1 declares no `outputSchema` and returns no `structuredContent`.
+
+**Stored content is untrusted data.** Wherever `get`, `search` or `promotion` show text from a Recollection or Entity, it is wrapped in delimiters such as `<recollection id="…" untrusted>…</recollection>`, after a one-line note that the content is reference data, not instructions. `write` does not try to detect instruction-like text.
+
+### 14.3 Annotations and loading
+
+| Tool | Annotations |
+|---|---|
+| `context`, `search`, `get`, `history`, `promotion` | `readOnlyHint: true` (Claude Code runs these in parallel) |
+| `write` | `destructiveHint: true` |
+| `scan` | none (it only reconciles derived data) |
+| `push` | `openWorldHint: true` |
+
+`context` and `search` set `_meta["anthropic/alwaysLoad"]: true`; the rest are found through tool search. This is why `serve` answers the handshake before its startup sequence finishes (§2).
+
+### 14.4 Output budgets
+
+Budgets are constants in code, not owner configuration. They keep every result under Claude Code's 10,000-token warning.
+
+| Tool | Budget |
+|---|---|
+| `search` | `limit` defaults to 10, maximum 25. No pagination: narrow the query instead |
+| `get` | About 30,000 characters. Whole items are returned in request order until the next won't fit; the rest are listed under `omitted` to fetch again. An item over the budget on its own is truncated with a marker |
+| `context` | About 4,000 characters. Lists are capped (e.g. 10 linked Entities, then "+N more"), with counts instead of lists where possible |
+| `promotion` | About 30,000 characters, with items beyond it listed under `omitted` |
+| errors | Under about 10,000 characters (Claude Code keeps only the first and last 5,000 of longer error text) |
+
+**`get` on a Recollection** returns its front-matter, `version`, body, per-Anchor staleness (with relocated line ranges) and `docs` URLs resolved for the installed version. **`get` on an Entity** returns its fields, `version`, description, `docs` resolved for the version installed in the current Checkout, and the IDs and titles of up to 10 Recollections about it, then "+N more" and a hint to `search` with `entities: [id]`.
+
+### 14.5 `write` results
+
+**Success** lists, per operation, an outcome line with any new IDs (and the refs they replace) and the new `version` of every file touched, then warnings (Anchors on uncommitted lines, Anchors relocated), then the commit SHA.
+
+**Rejection** lists every problem from §5.2 with its operation index and check, and for duplicates the candidates and decision table.
+
+### 14.6 Errors
+
+Domain failures are tool results with `isError: true`; JSON-RPC errors are only for protocol problems, such as input that fails the tool's JSON Schema. Each domain error starts with a stable code and ends with one line saying what to do next.
+
+| Code | When |
+|---|---|
+| `rejected` | A `write` batch failed its checks (§5.2) |
+| `conflict` | A `version` no longer matches the file (reported within a rejection) |
+| `not_found` | An ID passed to `get`, `history` or `promotion` doesn't exist |
+| `busy` | The startup sequence or the write lock didn't finish within the timeout |
