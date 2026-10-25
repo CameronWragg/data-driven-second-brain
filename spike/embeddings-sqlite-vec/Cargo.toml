@@ -1,0 +1,16 @@
+# PROTOTYPE — throwaway spike for wayfinder ticket #23. Never merged.
+[package]
+name = "spike-embed-vec"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fastembed = { version = "7.5", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+sqlite-vec = "0.1.9"
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
