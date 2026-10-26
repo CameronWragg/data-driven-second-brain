@@ -1,0 +1,54 @@
+# The only place dev-tool versions are written (ADR-0007). scripts/install-tools.sh
+# reads it in the dev container and in every CI job. Dependabot can't see it, so
+# bump it by hand: change `version`, then every `sha256` (GitHub shows each
+# release asset's digest).
+#
+# `url` is a template: {version} and {target} are filled in from this file.
+
+[just]
+version = "1.58.0"
+url = "https://github.com/casey/just/releases/download/{version}/just-{version}-{target}.tar.gz"
+
+[just.linux-x86_64]
+target = "x86_64-unknown-linux-musl"
+sha256 = "4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d"
+
+[just.linux-aarch64]
+target = "aarch64-unknown-linux-musl"
+sha256 = "748237128c4c40cbdabc65e841d05ceba13cc23a91eaba395495894c1d9764df"
+
+[just.macos-aarch64]
+target = "aarch64-apple-darwin"
+sha256 = "50ae3e996c974a0bf32ea7d10f495070df33f1b43e0616b2769e3d4821ed8f48"
+
+[cargo-nextest]
+version = "0.9.148"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{target}.tar.gz"
+
+[cargo-nextest.linux-x86_64]
+target = "x86_64-unknown-linux-musl"
+sha256 = "bf92cb81450872d960ffa13857a83084d557ec0cdc141663d263bb23ef756f97"
+
+[cargo-nextest.linux-aarch64]
+target = "aarch64-unknown-linux-musl"
+sha256 = "94676506ceaed01746d78cfe9ed124ee841b2932fd18d9d10f438a347bd9ba5e"
+
+[cargo-nextest.macos-aarch64]
+target = "universal-apple-darwin"
+sha256 = "6c23b7fb4ca82c571fc8dfedbab45bfa773d45918f933170c85d21cd7f4b852b"
+
+[cargo-deny]
+version = "0.20.2"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/{version}/cargo-deny-{version}-{target}.tar.gz"
+
+[cargo-deny.linux-x86_64]
+target = "x86_64-unknown-linux-musl"
+sha256 = "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+
+[cargo-deny.linux-aarch64]
+target = "aarch64-unknown-linux-musl"
+sha256 = "995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d"
+
+[cargo-deny.macos-aarch64]
+target = "aarch64-apple-darwin"
+sha256 = "fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3"

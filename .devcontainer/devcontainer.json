@@ -1,0 +1,40 @@
+{
+  "name": "latens",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+  // Bind mounts fail on a missing source, so make sure the Claude Code ones exist.
+  "initializeCommand": "mkdir -p \"$HOME/.claude\" && touch \"$HOME/.claude.json\"",
+  "mounts": [
+    "type=bind,source=${localEnv:HOME}/.claude,target=/home/vscode/.claude",
+    "type=bind,source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json",
+    "type=volume,source=latens-cargo-registry-${devcontainerId},target=/home/vscode/.cargo/registry",
+    "type=volume,source=latens-cache-${devcontainerId},target=/home/vscode/.cache",
+    "type=volume,source=latens-target-${devcontainerId},target=${containerWorkspaceFolder}/target"
+  ],
+  // Start with `GH_TOKEN=$(gh auth token) devcontainer up --workspace-folder .`.
+  // A bare `--env` copies the value from that environment without printing it.
+  "runArgs": ["--env", "GH_TOKEN"],
+  "containerEnv": {
+    "DISABLE_AUTOUPDATER": "1"
+  },
+  // The MCP Inspector's web UI and sandbox (`just inspect`). They bind the
+  // container's loopback, so only an editor's port forwarding reaches them.
+  "forwardPorts": [6274, 6275],
+  // A fresh named volume is owned by root.
+  "postCreateCommand": "sudo chown vscode \"${containerWorkspaceFolder}/target\"",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer"],
+      "settings": {
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer",
+          "editor.formatOnSave": true
+        },
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  }
+}
