@@ -26,10 +26,13 @@ There is one binary (provisional name `brain`) with these subcommands:
 1. Open the index (SQLite, WAL mode).
 2. Take the write lock (§11), then:
    1. Commit any uncommitted changes in the brain folder with an `Author: owner` trailer (§10).
-   2. Pull from the remote, rebasing local commits, and re-index the files changed by the pull.
-   3. Re-index any file whose content hash differs from the index, which picks up hand edits.
-   4. Delete Recollections that have been `abandoned` for more than 14 days.
-   5. Push any unpushed commits.
+   2. Pull from the remote, rebasing local commits.
+   3. Check the brain format (§17.2). If it is newer than this binary supports, stop here: no further maintenance and no push, and every tool returns `incompatible`. If it is older, bump it.
+   4. Re-index any file whose content hash differs from the index, which picks up the pull and hand edits. Every file passes through the migration chain on its way in (§17.3); if the index was built at a different format, it is rebuilt from every file.
+   5. Delete Recollections that have been `abandoned` for more than 14 days.
+   6. Push any unpushed commits.
+
+With no remote (§10), the pull and push are skipped.
 3. Detect the **Checkout** from the working directory, which gives the Repository and Branch.
 4. If any manifest hash differs from the last scan, run the scanner (§7).
 5. Detect the Branch lifecycle for the current Repository (§9.1). This needs the network and is skipped quietly when offline.
@@ -46,10 +49,11 @@ All network steps are best-effort: when offline, the brain carries on with local
   entities/repositories/<host>/<owner>/<name>.md
   entities/dependencies/<ecosystem>/<name>.md
   eval/queries.yaml                             # retrieval test set (§13)
+  brain.toml                                    # format version and dev marker (§17.2)
   .index/                                       # git-ignored: SQLite index and lock file
 ```
 
-By default the folder is at `$XDG_DATA_HOME/second-brain`. Files are the source of truth, and `.index/` can be rebuilt from them at any time ([ADR-0001](./adr/0001-files-as-truth-sqlite-as-index.md)).
+By default the folder is at `$XDG_DATA_HOME/second-brain`; the owner can move it with `brain.path` (§17.1). Files are the source of truth, and `.index/` can be rebuilt from them at any time ([ADR-0001](./adr/0001-files-as-truth-sqlite-as-index.md)).
 
 ## 4. Data model
 
@@ -217,6 +221,8 @@ Distinct: covers the v5 behaviour; 01HZX… covers v4
 Author: agent
 ```
 
+`Author` is `agent` for a `write` batch, `owner` for hand edits committed at startup (§10), and `server` for commits the binary makes on its own: scanner changes, deleting abandoned Recollections, and migrations (§17.3).
+
 Pushing is separate and explicit (§10).
 
 ## 6. Index and search
@@ -229,9 +235,9 @@ The index is one SQLite database in `.index/`, running in WAL mode. It holds:
 - a `sqlite-vec` table for embeddings
 - a Links table
 - Checkouts
-- metadata, including the embedding model ID and its dimensions
+- metadata, including the embedding model ID and its dimensions, the index schema version, and the brain format it was built at
 
-If the configured model differs from the one recorded, the brain rebuilds every embedding.
+If the configured model differs from the one recorded, the brain rebuilds every embedding. If the index schema version differs from the binary's, in either direction, the index is deleted and rebuilt: it has no SQL migrations. If the recorded brain format differs from `brain.toml`, every file is re-indexed through the migration chain (§17.3).
 
 ### 6.2 Preprocessing before embedding
 
@@ -248,7 +254,7 @@ For keyword search, the FTS5 table indexes both the original text and a version 
 
 The provider is a trait. The default implementation is a local ONNX model, chosen using the test set (§13); candidates include bge-small-en-v1.5, nomic-embed-text-v1.5 and EmbeddingGemma. An API-backed provider can be swapped in later.
 
-A second built-in provider, `hash`, needs no model: it feature-hashes the preprocessed tokens (identifiers split) into fixed-dimension unit vectors, so overlapping text scores as similar. It is deterministic and its quality is deliberately poor. It is documented for use where the ONNX model can't run, and it is what the test suite uses (§16).
+A second built-in provider, `hash`, needs no model: it feature-hashes the preprocessed tokens (identifiers split) into fixed-dimension unit vectors, so overlapping text scores as similar. It is deterministic and its quality is deliberately poor, and is selected with `embedding.provider = "hash"` (§17.1). It is documented for use where the ONNX model can't run, and it is what the test suite uses (§16).
 
 ### 6.4 Search
 
@@ -346,17 +352,18 @@ The Promotion is complete once no `active` Recollections remain on the merged Br
 - The brain uses the system `git` command, so the owner's existing git credentials apply.
 - Each batch is one commit (§5). Pushes happen on `push`, at shutdown, and at startup (to catch a missed shutdown push). There is no timer.
 - Before pushing, the brain pulls with `--rebase`. Conflicts are rare because each Recollection has its own file. If a rebase does conflict, the brain aborts it and reports the conflict through `context`.
+- **The remote** is the brain repository's own `origin`, never a configuration key. A brain with no remote (`brain init --no-remote`, §12) is a normal state: pulls and pushes are skipped, and `context` reports "no remote" as status rather than as a sync problem.
 - **Hand edits:** uncommitted changes found at startup are committed with `Author: owner`. A file that fails the schema checks (§5) is still indexed as-is, and `context` lists it as needing repair.
 
 ## 11. Concurrency
 
-Several `serve` processes can share one brain. `.index/lock` is an exclusive file lock. It's held for the startup maintenance steps and for each "write files → update index → commit" sequence, and other writers wait for it with a timeout. The timeout is a configuration value, so tests can make it short. Reads never take the lock; WAL mode keeps them consistent.
+Several `serve` processes can share one brain. `.index/lock` is an exclusive file lock. It's held for the startup maintenance steps and for each "write files → update index → commit" sequence, and other writers wait for it with a timeout. The timeout is a configuration value (`lock.timeout`, §17.1), so tests can make it short. Reads never take the lock; WAL mode keeps them consistent.
 
 ## 12. `brain init`
 
-1. Create the brain folder (default `$XDG_DATA_HOME/second-brain`) and its layout, with `.index/` git-ignored.
+1. Create the brain folder (default `$XDG_DATA_HOME/second-brain`, or `--path`) and its layout, with `.index/` git-ignored and `brain.toml` holding the current format. A debug build also writes `dev = true` (§17.2). If `--path` is not the default, write `brain.path` to the configuration file (§17.1); otherwise write no configuration file.
 2. Run `git init` and make the first commit.
-3. Create a **private** remote with `gh repo create --private` if `gh` is available; otherwise ask for a remote URL.
+3. Unless `--no-remote` is given, create a **private** remote with `gh repo create --private` if `gh` is available; otherwise ask for a remote URL.
 4. Print a generic MCP server config (`command`, `args`, stdio transport) plus short examples for common clients.
 5. Print the optional guidance snippet (§14.7) for the owner to paste into a global `CLAUDE.md` or `AGENTS.md`. `init` never edits those files.
 
@@ -428,6 +435,7 @@ Domain failures are tool results with `isError: true`; JSON-RPC errors are only 
 | `conflict` | A `version` no longer matches the file (reported within a rejection) |
 | `not_found` | An ID passed to `get`, `history` or `promotion` doesn't exist |
 | `busy` | The startup sequence or the write lock didn't finish within the timeout |
+| `incompatible` | The brain's format is newer than this binary supports (§17.2); names both versions and says to upgrade. Every tool returns it |
 
 ### 14.7 Agent guidance
 
@@ -536,6 +544,7 @@ Integration tests drive the real binary over MCP stdio using rmcp's client.
 - **Concurrency:** two or three real `serve` processes share one brain with a short lock timeout (§11). Each either waits its turn or returns `busy`.
 - **Crash recovery:** `serve` is SIGKILLed after a `write` and while it holds the lock during startup maintenance. A fresh `serve` must lose nothing, find the lock free, and push what was unpushed.
 - **Scanner:** `tests/fixtures/checkouts/<case>/` holds real manifest and lockfile sets for every row of §7.2, plus a workspace, a git dependency, a path dependency and a version that can't be parsed. They are copied into a temp Checkout and `git init`ed.
+- **Format upgrades:** `tests/fixtures/brains/v<N>/` holds a small, realistic brain frozen at every format version that has shipped, starting with `v1` when M1 lands; each format bump adds the previous version's fixture. A test copies each one, runs `serve`, and checks the migrated files (snapshots), the single `migrate` commit, and that a second start changes nothing. Another writes `format = <current + 1>` and asserts every tool returns `incompatible`.
 - **Output:** tool output is checked with `insta` snapshots, with ULIDs, hashes and timestamps redacted. Error codes, files on disk and git history get plain assertions.
 
 ### 16.4 Real model and eval
@@ -545,3 +554,46 @@ A separate opt-in group of tests (`just test-model`) uses the real model. It che
 ### 16.5 CI
 
 Every PR runs natively on Linux and macOS: `cargo fmt --check`, clippy with `-D warnings`, `cargo deny`, nextest's default profile (unit tests, integration tests and snapshots, all on the `hash` provider), and the real-model group, with the weights cached by pinned revision and hash. The eval gate runs on Linux only. There is no scheduled CI and no coverage threshold.
+
+## 17. Configuration and format versioning
+
+### 17.1 Configuration
+
+Configuration describes how *this machine* runs the brain; nothing in it is committed or synced. It lives in an optional TOML file at `$XDG_CONFIG_HOME/second-brain/config.toml`. A missing file means every default. An unknown key is an error that names it.
+
+XDG locations are used on macOS as well as Linux (`~/.config`, `~/.local/share`, `~/.cache` when the variables are unset), never `~/Library`. Development and tests isolate themselves by setting the `XDG_*` variables; there is no `--brain` flag and no other environment variable.
+
+| Key | Default | Notes |
+|---|---|---|
+| `brain.path` | `$XDG_DATA_HOME/second-brain` | Written by `init --path` (§12) |
+| `embedding.provider` | `onnx` | `onnx` or `hash` (§6.3) |
+| `embedding.model` | the default model (§6.3) | One of a closed list of supported models, each pinned in code by revision and hash |
+| `duplicates.threshold` | per model, in code | Similarity above which a `create` is checked as a duplicate (§5.2); tuned with `brain eval` |
+| `lock.timeout` | in code | How long a writer waits for the write lock (§11), as a duration string such as `"200ms"` |
+| `startup.timeout` | in code | How long a tool call waits for the startup sequence before returning `busy` (§2) |
+
+Everything else is a constant in code, including the output budgets (§14.4) and the 14-day abandonment window (§9.2): deleted Recollections stay reachable through git and `history`, so a longer window buys little. The remote is not configuration (§10).
+
+### 17.2 Brain format
+
+`brain.toml`, committed in the brain folder, records the brain's format version as one brain-wide integer (`format = 1`); files carry no version of their own. Any change to the schema of the files bumps it, even an additive one, because strict parsing makes an older binary reject fields it doesn't know. A bump whose migration changes nothing is fine.
+
+At startup, after the pull (§2):
+- **A newer format** than this binary supports: `serve` still answers the handshake, but stops maintenance and doesn't push, so it never spreads files in an older shape. Every tool returns `incompatible` (§14.6), naming both versions and saying to upgrade.
+- **An older format:** the binary bumps `brain.toml` and migrates (§17.3).
+
+**The dev marker.** A debug build's `init` writes `dev = true` into `brain.toml`, and a debug build refuses to open any brain without it. This keeps development builds off the owner's real brain wherever it lives, without comparing paths.
+
+### 17.3 Migrations
+
+A migration is a per-file transform that leaves a file already in its target shape untouched. The whole chain runs on every file on its way into the index, whether through a full rebuild, a pull or a hand edit, and any file it changes is rewritten. Because the index records the format it was built at (§6.1), a format change rebuilds it from every file.
+
+This also covers files written in the old format that arrive later: an offline machine still on the old binary writes Recollections, then upgrades and rebases them onto a brain another machine has already migrated. They are changed files, so they pass through the chain like any other.
+
+All the rewrites from one startup are one commit, with the subject `Migrate brain format 1 → 2` and trailers:
+```
+Action: migrate
+Format: 1 → 2
+Author: server
+```
+`Format` is left out when files were only normalised and the format didn't change. A file the chain can't migrate (a hand edit too broken to parse) is indexed as-is and listed by `context` as needing repair (§10). Migration never blocks startup and never deletes anything.
