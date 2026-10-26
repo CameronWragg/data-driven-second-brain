@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": ["Bash(just:*)", "Bash(cargo:*)", "Bash(git:*)"]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.rs) rustfmt --edition 2024 \"$f\" 2>/dev/null || true ;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

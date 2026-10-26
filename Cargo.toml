@@ -1,0 +1,15 @@
+[package]
+name = "latens"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Holds a Second Brain and serves it to Agents over MCP"
+license = "MIT"
+repository = "https://github.com/CameronWragg/latens"
+
+[[bin]]
+name = "latens"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
