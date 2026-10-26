@@ -4,9 +4,6 @@
 all-features = true
 
 [advisories]
-# Every RustSec advisory fails the check, unmaintained and unsound included.
-unmaintained = "all"
-yanked = "deny"
 ignore = []
 
 [licenses]

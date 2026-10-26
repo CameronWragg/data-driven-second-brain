@@ -4,6 +4,8 @@
 # release asset's digest).
 #
 # `url` is a template: {version} and {target} are filled in from this file.
+# The script reads only `[table]` headers and `key = "string"` lines, so keep
+# to those: no inline tables, arrays or quoted keys.
 
 [just]
 version = "1.58.0"

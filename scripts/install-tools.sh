@@ -58,7 +58,7 @@ sha256_of() {
 }
 
 install_tool() {
-  local tool="$1" platform="$2"
+  local tool="$1" platform="$2" work="$3"
   local version url target expected actual archive binary
   version="$(toml_get "$tool" version)"
   target="$(toml_get "$tool.$platform" target)"
@@ -95,10 +95,11 @@ main() {
   fi
   platform="$(platform)"
 
+  local work
   work="$(mktemp -d)"
-  trap 'rm -rf "$work"' EXIT
+  trap "rm -rf '$work'" EXIT
   for tool in "${tools[@]}"; do
-    install_tool "$tool" "$platform"
+    install_tool "$tool" "$platform" "$work"
   done
   echo "install-tools: installed ${tools[*]} into $install_dir"
 }

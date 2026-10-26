@@ -3,7 +3,7 @@ name = "latens"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "Holds a Second Brain and serves it to AI agents over MCP"
+description = "Holds a Second Brain and serves it to Agents over MCP"
 license = "MIT"
 repository = "https://github.com/CameronWragg/latens"
 

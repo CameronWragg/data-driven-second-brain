@@ -3,7 +3,10 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # Dev runs keep their brain, state and config in the git-ignored .dev/, away from
 # the real brain. XDG_CACHE_HOME stays shared so model weights aren't fetched again.
 dev := justfile_directory() / ".dev"
-dev_env := "XDG_DATA_HOME=" + dev / "data" + " XDG_STATE_HOME=" + dev / "state" + " XDG_CONFIG_HOME=" + dev / "config"
+dev_data := dev / "data"
+dev_state := dev / "state"
+dev_config := dev / "config"
+dev_env := "XDG_DATA_HOME=" + dev_data + " XDG_STATE_HOME=" + dev_state + " XDG_CONFIG_HOME=" + dev_config
 bin := justfile_directory() / "target/debug/latens"
 
 # The MCP Inspector `just inspect` runs; bumped by hand.
@@ -41,9 +44,9 @@ dev-claude *args: build
           "command": "{{ bin }}",
           "args": ["serve"],
           "env": {
-            "XDG_DATA_HOME": "{{ dev / "data" }}",
-            "XDG_STATE_HOME": "{{ dev / "state" }}",
-            "XDG_CONFIG_HOME": "{{ dev / "config" }}"
+            "XDG_DATA_HOME": "{{ dev_data }}",
+            "XDG_STATE_HOME": "{{ dev_state }}",
+            "XDG_CONFIG_HOME": "{{ dev_config }}"
           }
         }
       }
@@ -51,11 +54,12 @@ dev-claude *args: build
     JSON
     exec claude --mcp-config {{ dev }}/mcp.json --strict-mcp-config {{ args }}
 
-# Run the MCP Inspector against `latens serve` on the dev brain: the web UI on
-# port 6274, or pass `--cli --method tools/list` and so on for the CLI
+# Run the MCP Inspector against `latens serve` on the dev brain. Its web UI is on
+# the container's port 6274, which only an editor's port forwarding reaches; from
+# `devcontainer exec`, pass `--cli --method tools/list` and so on instead.
 inspect *args: build
     npx -y {{ inspector }} {{ args }} \
-        -e XDG_DATA_HOME={{ dev / "data" }} -e XDG_STATE_HOME={{ dev / "state" }} -e XDG_CONFIG_HOME={{ dev / "config" }} \
+        -e XDG_DATA_HOME={{ dev_data }} -e XDG_STATE_HOME={{ dev_state }} -e XDG_CONFIG_HOME={{ dev_config }} \
         {{ bin }} serve
 
 # Delete the dev brain, state and config

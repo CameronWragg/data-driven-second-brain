@@ -20,7 +20,7 @@ Every build, test and agent session runs inside the dev container (ADR-0006). Fr
 - `just dev-serve`, `just dev-claude`, `just inspect`: run the binary against the dev brain in `.dev/`, never the owner's real brain. Run `latens` only through these.
 - `just dev-reset`: wipe the dev brain.
 
-Dev tool versions live only in `.config/tool-versions.toml`; the Rust version lives only in `rust-toolchain.toml`. A pin bump is its own PR.
+The versions of `just`, `cargo-nextest` and `cargo-deny` live only in `.config/tool-versions.toml`; the Rust version lives only in `rust-toolchain.toml`. A pin bump is its own PR.
 
 ## Pull requests
 

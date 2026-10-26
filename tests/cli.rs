@@ -1,10 +1,19 @@
 //! The `latens` binary's command line, as an owner or Agent sees it.
 
+use std::path::Path;
 use std::process::{Command, Output};
 
+/// Runs `latens` with `HOME` and the XDG directories inside the test's own
+/// scratch space, so it can never reach the owner's brain or configuration.
 fn latens(args: &[&str]) -> Output {
+    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-home");
     Command::new(env!("CARGO_BIN_EXE_latens"))
         .args(args)
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
         .output()
         .expect("latens runs")
 }
