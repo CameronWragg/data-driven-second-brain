@@ -14,9 +14,9 @@ There is one binary, `latens`, with these subcommands. The same name is used for
 
 | Command | Purpose |
 |---|---|
-| `latens init` | Create a Second Brain (§12) |
+| `latens init` | Create a Second Brain, or join one with `--clone` (§12) |
 | `latens serve` | Run the MCP server over stdio; this is what Agents launch |
-| `latens reindex` | Delete and rebuild the index from files |
+| `latens reindex` | Rebuild the index from files, in place (§6.1) |
 | `latens eval` | Run the retrieval test set (§13) |
 | `latens hook stop` | The Claude Code plugin's Stop hook (§15.2); short-lived, run by the client |
 
@@ -37,9 +37,10 @@ There is one binary, `latens`, with these subcommands. The same name is used for
    6. Push any unpushed commits, then release the lock.
 
    With no remote (§10), the fetch, rebase and push are skipped; the rest still runs under the lock.
-4. Detect the **Checkout** from `CLAUDE_PROJECT_DIR` when it is set, otherwise from the working directory, which gives the Repository and Branch.
+4. Detect the **Checkout** from `CLAUDE_PROJECT_DIR` when it is set, otherwise from the working directory, which gives the Repository and Branch. If the brain has no Entity for that Repository, `serve` creates it (`id`, `name`, `default_branch`, `forked_from` when known) in a commit with `Author: server`; it never waits for the scanner (§7) to do so.
 5. If any manifest hash differs from the last scan, run the scanner (§7).
 6. Detect the Branch lifecycle for the current Repository (§9.1). This needs the network and is skipped quietly when offline.
+7. If the configured model's weights are missing from the cache (§6.3), fetch them in the background, bounded by `model.timeout`. Until the model is loaded, `search` is keyword-only and duplicate checks (§5.2) are skipped, and `context` says so. Loading the model never delays the handshake.
 
 All network steps are best-effort and bounded by `sync.timeout` (§17.1): a failure or timeout counts as offline, and the brain carries on with local data and reports this through `context`.
 
@@ -185,7 +186,7 @@ All changes go through the `write` tool as a **batch** of operations. A batch is
 | `supersede` | `id`, `version`, `replacement` (the `create` fields) | Creates the replacement, records `supersedes`, deletes the old Recollection |
 | `delete` | `id`, `version` | |
 | `link` / `unlink` | `from`, `type`, `to`, `from_version`; optional `version` (the `depends-on` version) | `from_version` is the concurrency version of the file the Link starts from |
-| `create_entity` | `id`, `name`, optional `description`, `docs`, `ref` | For Entities the scanner doesn't make: a `calls` target not checked out here, a Dependency outside §7.2 |
+| `create_entity` | `id`, `name`, optional `description`, `docs`, `ref` | For Entities neither the server (§2 step 4) nor the scanner makes: a `calls` target not checked out here, a Dependency outside §7.2 |
 | `update_entity` | `id`, `version`; any of `name`, `description`, `docs` | All other Entity fields belong to the server and scanner |
 | `set_branch_status` | `branch`, `outcome: merged \| closed`, optional `into` (defaults to the default branch) | Settles a Branch by hand (§9.1) |
 
@@ -265,9 +266,11 @@ The index is one SQLite database in `.index/`, running in WAL mode. It holds:
 - a `sqlite-vec` table for embeddings
 - a Links table
 - Checkouts
-- metadata, including the embedding model ID and its dimensions, the index schema version, and the brain format it was built at
+- metadata, including the embedding model ID, its pinned revision and file hash, its dimensions, the index schema version, and the brain format it was built at
 
-If the configured model differs from the one recorded, the brain rebuilds every embedding. If the index schema version differs from the binary's, in either direction, the index is deleted and rebuilt: it has no SQL migrations. If the recorded brain format differs from `brain.toml`, every file is re-indexed through the migration chain (§17.3).
+The `sqlite-vec` table carries the scope fields search filters on (Repository, Branch, Kind, state) as metadata or partition columns, so filters apply inside the nearest-neighbour search rather than after it, which would return fewer than `limit` results. `sqlite-vec` is brute-force only, which is ample at the brain's size.
+
+If the configured model or its revision differs from the one recorded, the brain rebuilds every embedding. If the index schema version differs from the binary's, in either direction, the index is rebuilt: it has no SQL migrations. **A rebuild never deletes or replaces the database file**, since other `serve` processes may have it open and swapping it under them risks corrupting the WAL; the tables are dropped and recreated inside the file, under the write lock. `latens reindex` does the same. If the recorded brain format differs from `brain.toml`, every file is re-indexed through the migration chain (§17.3).
 
 ### 6.2 Preprocessing before embedding
 
@@ -284,7 +287,7 @@ For keyword search, the FTS5 table indexes both the original text and a version 
 
 ### 6.3 Embedding provider
 
-The provider is a trait. Besides embedding, it reports its input limit and counts the tokens of a text, so the brain knows when text is truncated (§6.2). The default implementation is a local ONNX model, chosen using the test set (§13); candidates include bge-small-en-v1.5, nomic-embed-text-v1.5 and EmbeddingGemma. An API-backed provider can be swapped in later.
+The provider is a trait. Besides embedding, it reports its input limit and counts the tokens of a text, so the brain knows when text is truncated (§6.2). The default implementation runs a local ONNX model through `fastembed` on `ort`, with ONNX Runtime statically linked. The default model is bge-small-en-v1.5 in fp32 from BAAI's own repository (384 dimensions); other supported models, such as nomic-embed-text-v1.5 and EmbeddingGemma, are chosen using the test set (§13). Each model is pinned in code by revision and SHA-256 and has its own query and document templates (§6.2). Weights are not bundled: `latens init` fetches them into `$XDG_CACHE_HOME/latens/models/`, outside the brain repository, and `serve` and `reindex` fetch any that are missing (§2 step 7). A file whose hash doesn't match is discarded. An API-backed provider can be swapped in later.
 
 A second built-in provider, `hash`, needs no model: it feature-hashes the preprocessed tokens (identifiers split) into fixed-dimension unit vectors, so overlapping text scores as similar. It is deterministic, has no input limit (it never truncates), and its quality is deliberately poor, and is selected with `embedding.provider = "hash"` (§17.1). It is documented for use where the ONNX model can't run, and it is what the test suite uses (§16).
 
@@ -415,19 +418,22 @@ We accept the small risk that the owner runs `git` by hand in the brain folder a
 
 ## 11. Concurrency
 
-Several `serve` processes can share one brain. `.index/lock` is an exclusive `flock`, so `git` children that inherit its descriptor keep it held (§2). It's held for the startup recovery steps, for the local part of every sync (rebase, re-index, maintenance, push; never the fetch, §10.1), and for each "write journal → write files → update index → commit" sequence, and other writers wait for it with a timeout. The timeout is a configuration value (`lock.timeout`, §17.1), so tests can make it short. Reads never take the lock; WAL mode keeps them consistent.
+Several `serve` processes can share one brain, on one machine. The brain folder must be on a local filesystem: SQLite's WAL does not work over network filesystems. Every SQLite connection sets `busy_timeout`, writes use `BEGIN IMMEDIATE`, and read transactions are kept short so checkpoints are never starved and the WAL doesn't grow without bound. `.index/lock` is an exclusive `flock`, so `git` children that inherit its descriptor keep it held (§2). It's held for the startup recovery steps, for the local part of every sync (rebase, re-index, maintenance, push; never the fetch, §10.1), and for each "write journal → write files → update index → commit" sequence, and other writers wait for it with a timeout. The timeout is a configuration value (`lock.timeout`, §17.1), so tests can make it short. Reads never take the lock; WAL mode keeps them consistent.
 
 ## 12. `latens init`
+
+`latens init` creates a new Second Brain. `latens init --clone <url>` joins an existing one from another machine: it clones the brain repository into the brain folder (default `$XDG_DATA_HOME/latens`, or `--path`), writes `brain.path` if the path is not the default, and then does steps 4 to 6 below. The brain repository's `origin` is the URL it was cloned from.
 
 1. Create the brain folder (default `$XDG_DATA_HOME/latens`, or `--path`) and its layout, with `.index/` git-ignored and `brain.toml` holding the current format. A debug build also writes `dev = true` (§17.2). If `--path` is not the default, write `brain.path` to the configuration file (§17.1); otherwise write no configuration file.
 2. Run `git init` and make the first commit.
 3. Unless `--no-remote` is given, create a **private** remote with `gh repo create --private` if `gh` is available; otherwise ask for a remote URL.
 4. Print a generic MCP server config (`command`, `args`, stdio transport) plus short examples for common clients.
 5. Print the optional guidance snippet (§14.7) for the owner to paste into a global `CLAUDE.md` or `AGENTS.md`. `init` never edits those files.
+6. Fetch the configured model's weights into the cache (§6.3), unless `embedding.provider` is `hash`. A failed fetch is reported but doesn't fail `init`; `serve` tries again.
 
 ## 13. Retrieval test set
 
-`eval/queries.yaml` lists queries, each with the Recollection IDs it should find and an optional scope. `latens eval` reports recall@5, recall@10 and mean reciprocal rank (MRR). It's used to choose the embedding model, check that preprocessing helps, and catch search getting worse. It includes at least one long Recollection that a query matches only on text past the model's input window, so it shows keyword search covering truncation (§6.2). This repo also includes a small fixture brain with its own test set for CI, and its scores are committed in `eval/baseline.json`. CI fails if recall@5, recall@10 or MRR drops more than 0.02 below the baseline; changes to the model, preprocessing or ranking update the baseline in the same PR (§16.4).
+`eval/queries.yaml` lists queries, each with the Recollection IDs it should find and an optional scope. `latens eval` reports recall@5, recall@10 and mean reciprocal rank (MRR). It's used to choose the embedding model, check that preprocessing helps, and catch search getting worse. It includes at least one long Recollection that a query matches only on text past the model's input window, so it shows keyword search covering truncation (§6.2). It also measures duplicate detection for each supported model: pairs that rewrite the same knowledge against pairs that are only near neighbours, reporting how well each candidate threshold separates them. The duplicate threshold (§5.2) is stored in code with the model it was tuned for; Basic Memory's 0.70 cutoff for bge-small is only a starting point. This repo also includes a small fixture brain with its own test set for CI, and its scores are committed in `eval/baseline.json`. CI fails if recall@5, recall@10 or MRR drops more than 0.02 below the baseline; changes to the model, preprocessing or ranking update the baseline in the same PR (§16.4).
 
 ## 14. MCP tools
 
@@ -634,12 +640,13 @@ XDG locations are used on macOS as well as Linux (`~/.config`, `~/.local/share`,
 
 | Key | Default | Notes |
 |---|---|---|
-| `brain.path` | `$XDG_DATA_HOME/latens` | Written by `init --path` (§12) |
+| `brain.path` | `$XDG_DATA_HOME/latens` | Written by `init --path` or `init --clone` (§12) |
 | `embedding.provider` | `onnx` | `onnx` or `hash` (§6.3) |
 | `embedding.model` | the default model (§6.3) | One of a closed list of supported models, each pinned in code by revision and hash |
 | `duplicates.threshold` | per model, in code | Similarity above which a `create` is checked as a duplicate (§5.2); tuned with `latens eval` |
 | `lock.timeout` | in code | How long a writer waits for the write lock (§11), as a duration string such as `"200ms"` |
 | `startup.timeout` | in code | How long a tool call waits for the startup sequence before returning `busy` (§2) |
+| `model.timeout` | in code | The limit on fetching missing model weights at startup (§2 step 7) |
 | `sync.timeout` | about 30 s | The limit on each `git` network step (§10.1) and so on how long an orphaned `git` child can live on macOS (§2); a timeout counts as offline |
 
 Everything else is a constant in code, including the output budgets (§14.4) and the 14-day abandonment window (§9.2): deleted Recollections stay reachable through git and `history`, so a longer window buys little. The remote is not configuration (§10).
@@ -667,3 +674,16 @@ Format: 1 → 2
 Author: server
 ```
 `Format` is left out when files were only normalised and the format didn't change. A file the chain can't migrate (a hand edit too broken to parse) is indexed as-is and listed by `context` as needing repair (§10). Migration never blocks startup and never deletes anything.
+
+## 18. Performance budgets
+
+Measured on the owner's development machine with the default model and a brain of 10,000 Recollections:
+
+| Measure | Budget | Baseline from the spike |
+|---|---|---|
+| `initialize` and `tools/list` answered after launch | under 1 s, whatever the model is doing | — |
+| Model loaded and ready | under 1 s | 250–535 ms |
+| Hybrid `search`, p95 | under 100 ms | 26–51 ms |
+| Resident memory per `serve` | under 500 MB | 150–400 MB |
+
+Only the handshake budget is asserted in CI, in the real-model test group (§16.4). The rest are checked with `just bench`, run by hand before a release and after changes to the model, preprocessing or ranking.
