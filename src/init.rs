@@ -7,6 +7,7 @@ use anyhow::bail;
 use crate::brain::Brain;
 use crate::config::{self, Config, Dirs};
 
+/// Creates a Second Brain and prints how to connect an Agent to it.
 pub fn run(no_remote: bool, path: Option<PathBuf>) -> anyhow::Result<()> {
     if !no_remote {
         bail!("creating a remote is not implemented yet; pass --no-remote");
@@ -40,7 +41,7 @@ The `latens` MCP server holds my durable knowledge about the code I work on.
 /// and the guidance snippet to paste. `init` itself edits no client's files.
 fn connect_text(root: &Path, exe: &Path) -> String {
     let exe = exe.to_string_lossy();
-    let quoted = quoted(&exe);
+    let quoted = json_quoted(&exe);
     format!(
         r#"Created a Second Brain at {root}, with no remote.
 
@@ -74,7 +75,7 @@ CLAUDE.md or AGENTS.md:
 }
 
 /// `text` as a JSON string, which is also a valid TOML basic string.
-fn quoted(text: &str) -> String {
+fn json_quoted(text: &str) -> String {
     let mut quoted = String::from('"');
     for c in text.chars() {
         match c {

@@ -5,6 +5,7 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
+/// Why a `git` command failed.
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
     #[error("couldn't run git: {0}")]

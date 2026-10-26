@@ -19,6 +19,7 @@ pub enum Build {
 }
 
 impl Build {
+    /// The build this binary is.
     pub const CURRENT: Build = if cfg!(debug_assertions) {
         Build::Debug
     } else {
@@ -41,6 +42,7 @@ pub struct Brain {
     format: u32,
 }
 
+/// Why a brain folder couldn't be opened.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
     #[error("{} isn't a Second Brain: it has no brain.toml", root.display())]
@@ -69,6 +71,7 @@ const LAYOUT: [&str; 5] = [
     ".index",
 ];
 
+/// Why a brain folder couldn't be created.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateError {
     #[error("{} isn't empty; init creates a brain only in a new or empty folder", root.display())]
@@ -169,10 +172,12 @@ impl Brain {
         })
     }
 
+    /// The brain folder.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// The format version in its `brain.toml`.
     pub fn format(&self) -> u32 {
         self.format
     }

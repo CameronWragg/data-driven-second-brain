@@ -44,6 +44,16 @@ impl Dirs {
             data_home: dir("XDG_DATA_HOME", ".local/share")?,
         })
     }
+
+    /// Where this machine's configuration file is.
+    pub fn config_file(&self) -> PathBuf {
+        self.config_home.join("latens/config.toml")
+    }
+
+    /// Where the brain folder is when `brain.path` isn't set (SPEC §3).
+    pub fn default_brain_path(&self) -> PathBuf {
+        self.data_home.join("latens")
+    }
 }
 
 /// Which embedding provider builds vectors (SPEC §6.3).
@@ -74,6 +84,7 @@ pub struct Config {
 /// The default for `sync.timeout`.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Why the configuration file couldn't be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("couldn't read {}: {source}", path.display())]
@@ -98,7 +109,7 @@ pub enum ConfigError {
 /// `config.toml` as written; every table rejects keys it doesn't know.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct File {
+struct ConfigToml {
     brain: BrainTable,
     embedding: EmbeddingTable,
     duplicates: DuplicatesTable,
@@ -145,13 +156,13 @@ fn duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Duratio
 impl Config {
     /// Loads `config.toml` from `dirs`; a missing file means every default.
     pub fn load(dirs: &Dirs) -> Result<Config, ConfigError> {
-        let path = config_file(dirs);
+        let path = dirs.config_file();
         let file = match std::fs::read_to_string(&path) {
             Ok(text) => toml_edit::de::from_str(&text).map_err(|source| ConfigError::Parse {
                 path: path.clone(),
                 source,
             })?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => File::default(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ConfigToml::default(),
             Err(source) => return Err(ConfigError::Read { path, source }),
         };
         let brain_path = match file.brain.path {
@@ -159,7 +170,7 @@ impl Config {
                 return Err(ConfigError::RelativeBrainPath { path, brain_path });
             }
             Some(brain_path) => brain_path,
-            None => default_brain_path(dirs),
+            None => dirs.default_brain_path(),
         };
         Ok(Config {
             brain_path,
@@ -177,7 +188,7 @@ impl Config {
 /// Sets `brain.path` in the configuration file, creating the file if need be
 /// and keeping everything else in it as it was.
 pub fn set_brain_path(dirs: &Dirs, brain_path: &Path) -> Result<(), ConfigError> {
-    let path = config_file(dirs);
+    let path = dirs.config_file();
     let value = brain_path
         .to_str()
         .ok_or_else(|| ConfigError::NotUtf8(brain_path.into()))?;
@@ -197,18 +208,10 @@ pub fn set_brain_path(dirs: &Dirs, brain_path: &Path) -> Result<(), ConfigError>
         path: path.clone(),
         source,
     };
-    std::fs::create_dir_all(dirs.config_home.join("latens")).map_err(write)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(write)?;
+    }
     std::fs::write(&path, document.to_string()).map_err(write)
-}
-
-/// Where this machine's configuration file is.
-pub fn config_file(dirs: &Dirs) -> PathBuf {
-    dirs.config_home.join("latens/config.toml")
-}
-
-/// Where the brain folder is when `brain.path` isn't set (SPEC §3).
-pub fn default_brain_path(dirs: &Dirs) -> PathBuf {
-    dirs.data_home.join("latens")
 }
 
 #[cfg(test)]
