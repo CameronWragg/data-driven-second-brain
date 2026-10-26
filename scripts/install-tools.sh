@@ -89,19 +89,19 @@ install_tool() {
 
 main() {
   [[ -f "$versions_file" ]] || die "missing $versions_file"
-  local tools=("$@") platform
-  if [[ ${#tools[@]} -eq 0 ]]; then
-    mapfile -t tools < <(sed -n 's/^\[\([^].]*\)\][[:space:]]*$/\1/p' "$versions_file")
+  # Positional parameters rather than arrays: macOS runners may run this with
+  # bash 3.2, which has no `mapfile`.
+  if [[ $# -eq 0 ]]; then
+    set -- $(sed -n 's/^\[\([^].]*\)\][[:space:]]*$/\1/p' "$versions_file")
   fi
+  local platform work
   platform="$(platform)"
-
-  local work
   work="$(mktemp -d)"
   trap "rm -rf '$work'" EXIT
-  for tool in "${tools[@]}"; do
+  for tool in "$@"; do
     install_tool "$tool" "$platform" "$work"
   done
-  echo "install-tools: installed ${tools[*]} into $install_dir"
+  echo "install-tools: installed $* into $install_dir"
 }
 
 main "$@"
