@@ -1,5 +1,11 @@
 //! Latens holds a Second Brain and serves it to Agents over MCP.
 
+pub mod brain;
+pub mod config;
+mod git;
+mod init;
+
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -15,7 +21,14 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Create a Second Brain, or join one with --clone
-    Init,
+    Init {
+        /// Create the brain without a remote; it can be given one later
+        #[arg(long)]
+        no_remote: bool,
+        /// Put the brain folder here instead of $XDG_DATA_HOME/latens
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     /// Run the MCP server over stdio; this is what Agents launch
     Serve,
     /// Rebuild the index from files, in place
@@ -36,7 +49,9 @@ pub enum Hook {
 /// Runs a parsed command line, returning the process exit code.
 pub fn run(cli: Cli) -> ExitCode {
     let name = match cli.command {
-        Command::Init => "init",
+        Command::Init { no_remote, path } => {
+            return report("init", init::run(no_remote, path));
+        }
         Command::Serve => "serve",
         Command::Reindex => "reindex",
         Command::Eval => "eval",
@@ -44,4 +59,15 @@ pub fn run(cli: Cli) -> ExitCode {
     };
     eprintln!("latens {name}: not implemented yet");
     ExitCode::FAILURE
+}
+
+/// Turns a command's result into its exit code, printing any error.
+fn report(name: &str, result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("latens {name}: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
 }

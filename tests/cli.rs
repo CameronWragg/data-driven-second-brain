@@ -1,25 +1,11 @@
 //! The `latens` binary's command line, as an owner or Agent sees it.
 
-use std::path::Path;
-use std::process::{Command, Output};
+mod common;
 
-/// Runs `latens` with `HOME` and the XDG directories inside the test's own
-/// scratch space, so it can never reach the owner's brain or configuration.
-fn latens(args: &[&str]) -> Output {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-home");
-    Command::new(env!("CARGO_BIN_EXE_latens"))
-        .args(args)
-        .env("HOME", &home)
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_CACHE_HOME", home.join("cache"))
-        .output()
-        .expect("latens runs")
-}
+use common::{TestBrain, stderr, stdout};
 
-fn stdout(output: &Output) -> String {
-    String::from_utf8(output.stdout.clone()).expect("stdout is UTF-8")
+fn latens(args: &[&str]) -> std::process::Output {
+    TestBrain::new().latens(args)
 }
 
 #[test]
@@ -57,6 +43,7 @@ fn hook_help_lists_stop() {
 fn unbuilt_subcommands_fail_and_say_so() {
     for args in [
         &["init"][..],
+        &["init", "--path", "/brains/mine"],
         &["serve"],
         &["reindex"],
         &["eval"],
@@ -69,7 +56,7 @@ fn unbuilt_subcommands_fail_and_say_so() {
             "`latens {}` succeeded",
             args.join(" ")
         );
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr(&output);
         assert!(
             stderr.contains("not implemented yet"),
             "`latens {}` stderr: {stderr}",
