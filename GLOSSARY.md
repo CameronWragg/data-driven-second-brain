@@ -8,6 +8,10 @@ An AI-first personal knowledge system that holds structured, linked knowledge ab
 The whole knowledge store belonging to one owner, together with everything that indexes and serves it.
 _Avoid_: Knowledge base, vault, workspace
 
+**Latens**:
+The product: the program that holds a Second Brain and serves it to Agents. One owner may install Latens on several machines, all serving the same Second Brain.
+_Avoid_: brain (as the program's name), second-brain
+
 **Agent**:
 An AI client that reads from and writes to the Second Brain through its MCP interface; the primary user of the system.
 _Avoid_: Bot, assistant, client
