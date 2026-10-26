@@ -1,0 +1,5 @@
+{
+  "name": "brain",
+  "description": "PROTOTYPE: Second Brain for Claude Code: registers the MCP server, adds /brain:remember, and nudges a write at the end of a task that changed code.",
+  "version": "0.0.0"
+}
