@@ -248,6 +248,8 @@ For keyword search, the FTS5 table indexes both the original text and a version 
 
 The provider is a trait. The default implementation is a local ONNX model, chosen using the test set (§13); candidates include bge-small-en-v1.5, nomic-embed-text-v1.5 and EmbeddingGemma. An API-backed provider can be swapped in later.
 
+A second built-in provider, `hash`, needs no model: it feature-hashes the preprocessed tokens (identifiers split) into fixed-dimension unit vectors, so overlapping text scores as similar. It is deterministic and its quality is deliberately poor. It is documented for use where the ONNX model can't run, and it is what the test suite uses (§16).
+
 ### 6.4 Search
 
 1. **Scope.** By default the search covers:
@@ -348,7 +350,7 @@ The Promotion is complete once no `active` Recollections remain on the merged Br
 
 ## 11. Concurrency
 
-Several `serve` processes can share one brain. `.index/lock` is an exclusive file lock. It's held for the startup maintenance steps and for each "write files → update index → commit" sequence, and other writers wait for it with a timeout. Reads never take the lock; WAL mode keeps them consistent.
+Several `serve` processes can share one brain. `.index/lock` is an exclusive file lock. It's held for the startup maintenance steps and for each "write files → update index → commit" sequence, and other writers wait for it with a timeout. The timeout is a configuration value, so tests can make it short. Reads never take the lock; WAL mode keeps them consistent.
 
 ## 12. `brain init`
 
@@ -360,7 +362,7 @@ Several `serve` processes can share one brain. `.index/lock` is an exclusive fil
 
 ## 13. Retrieval test set
 
-`eval/queries.yaml` lists queries, each with the Recollection IDs it should find and an optional scope. `brain eval` reports recall@5, recall@10 and mean reciprocal rank (MRR). It's used to choose the embedding model, check that preprocessing helps, and catch search getting worse. This repo also includes a small fixture brain with its own test set for CI.
+`eval/queries.yaml` lists queries, each with the Recollection IDs it should find and an optional scope. `brain eval` reports recall@5, recall@10 and mean reciprocal rank (MRR). It's used to choose the embedding model, check that preprocessing helps, and catch search getting worse. This repo also includes a small fixture brain with its own test set for CI, and its scores are committed in `eval/baseline.json`. CI fails if recall@5, recall@10 or MRR drops more than 0.02 below the baseline; changes to the model, preprocessing or ranking update the baseline in the same PR (§16.4).
 
 ## 14. MCP tools
 
@@ -506,3 +508,40 @@ At the end of each Agent turn, Claude Code passes the hook the transcript path, 
 
 The prompt asks whether the task produced a Recollection that isn't obvious from the code. If it didn't, the Agent finishes without writing and doesn't mention the brain.
 
+## 16. Testing
+
+### 16.1 Seams
+
+The filesystem, SQLite (FTS5 and `sqlite-vec`) and the system `git` are real in every test. Only four things are faked, each behind a trait in the core library:
+
+| Trait | Real | In unit tests | In integration tests |
+|---|---|---|---|
+| `Forge` | `gh` (§9.1) | in-memory double | a scripted fake `gh` executable on a controlled `PATH`: absent, logged out (`gh auth status` exits 1), merged, closed, no PR, error |
+| `Clock` | system time | injected | not faked: tests backdate stored timestamps (e.g. `abandoned_at` 15 and 13 days ago) |
+| `Embedder` | ONNX model (§6.3) | `hash` provider | `hash` provider, chosen through configuration |
+| `Registry` | npm/pypi metadata (§7.3) | recorded JSON responses | unreachable: the harness points `HTTP(S)_PROXY` at a dead port, and tests assert the scan still succeeds |
+
+The shipped binary has no test-only switches: no clock override and no test feature build.
+
+### 16.2 Unit tests
+
+In-module tests use the injected traits. `proptest` covers the pure transforms only: Anchor text normalisation and re-location (§8), identifier splitting (§6.2), the frontmatter round-trip, and the secret scanner's shape allowlist (no SHA, hash or ULID is ever flagged).
+
+### 16.3 Integration tests
+
+Integration tests drive the real binary over MCP stdio using rmcp's client.
+
+- **Harness:** every test goes through a `TestBrain` harness that gives it a fresh tempdir as `HOME` and `XDG_*`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` set to `/dev/null`, a fixed git author, a controlled `PATH` and the model cache. No test reaches the owner's brain, git credentials, `gh` login or the network.
+- **Remotes:** local bare repos added by path. A second clone plays another machine (concurrent pushes, rebase conflicts, deleted Branches). Network loss is simulated by renaming the bare repo away; any failed remote step is treated as offline (§2).
+- **Concurrency:** two or three real `serve` processes share one brain with a short lock timeout (§11). Each either waits its turn or returns `busy`.
+- **Crash recovery:** `serve` is SIGKILLed after a `write` and while it holds the lock during startup maintenance. A fresh `serve` must lose nothing, find the lock free, and push what was unpushed.
+- **Scanner:** `tests/fixtures/checkouts/<case>/` holds real manifest and lockfile sets for every row of §7.2, plus a workspace, a git dependency, a path dependency and a version that can't be parsed. They are copied into a temp Checkout and `git init`ed.
+- **Output:** tool output is checked with `insta` snapshots, with ULIDs, hashes and timestamps redacted. Error codes, files on disk and git history get plain assertions.
+
+### 16.4 Real model and eval
+
+A separate opt-in group of tests (`just test-model`) uses the real model. It checks that the model loads off the handshake path with `tools/list` answered well inside 5 s, that embeddings round-trip through `sqlite-vec`, and that a model change rebuilds every embedding. The eval gate (§13) runs the fixture brain with the real model.
+
+### 16.5 CI
+
+Every PR runs natively on Linux and macOS: `cargo fmt --check`, clippy with `-D warnings`, `cargo deny`, nextest's default profile (unit tests, integration tests and snapshots, all on the `hash` provider), and the real-model group, with the weights cached by pinned revision and hash. The eval gate runs on Linux only. There is no scheduled CI and no coverage threshold.
