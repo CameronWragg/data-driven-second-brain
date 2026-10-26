@@ -89,7 +89,7 @@ install_tool() {
 
 main() {
   [[ -f "$versions_file" ]] || die "missing $versions_file"
-  # Positional parameters rather than arrays: macOS runners may run this with
+  # Positional parameters rather than arrays, so this runs under macOS's own
   # bash 3.2, which has no `mapfile`.
   if [[ $# -eq 0 ]]; then
     set -- $(sed -n 's/^\[\([^].]*\)\][[:space:]]*$/\1/p' "$versions_file")

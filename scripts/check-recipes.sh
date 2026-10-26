@@ -6,6 +6,8 @@
 # Only code counts: `just <recipe>` inside an inline code span or a fenced block.
 set -euo pipefail
 
+die() { echo "check-recipes: $*" >&2; exit 1; }
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [[ $# -eq 0 ]]; then
@@ -13,7 +15,7 @@ if [[ $# -eq 0 ]]; then
     if [[ -f "$doc" ]]; then set -- "$@" "$doc"; fi
   done
 fi
-if [[ $# -eq 0 ]]; then echo "check-recipes: no docs to check" >&2; exit 1; fi
+if [[ $# -eq 0 ]]; then die "no docs to check"; fi
 
 recipes=" $(just --justfile "$root/justfile" --summary) "
 missing=0
@@ -23,6 +25,7 @@ missing=0
 # (`just --list`) are skipped.
 mentions() {
   awk '
+    FNR == 1 { fenced = 0 }
     /^[[:space:]]*(```|~~~)/ { fenced = !fenced; next }
     {
       if (fenced) { code = $0 }
@@ -43,12 +46,14 @@ mentions() {
   ' "$@"
 }
 
+# Captured first so `set -e` sees awk fail, e.g. on a missing file.
+found="$(mentions "$@")"
 while IFS=: read -r file line recipe; do
-  if [[ "$recipes" != *" $recipe "* ]]; then
+  if [[ -n "$recipe" && "$recipes" != *" $recipe "* ]]; then
     echo "$file:$line: no recipe \`$recipe\` in the justfile" >&2
     missing=1
   fi
-done < <(mentions "$@")
+done <<<"$found"
 
 if [[ $missing -eq 0 ]]; then echo "check-recipes: every recipe named in $* exists"; fi
 exit "$missing"
