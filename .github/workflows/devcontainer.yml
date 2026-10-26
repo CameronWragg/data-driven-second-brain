@@ -1,0 +1,41 @@
+# Builds the dev container and runs the full local gate inside it, only when the
+# environment changes (ADR-0006): the container definition, the toolchain pin,
+# the tool versions or the script that installs them (the Dockerfile bakes all
+# four into the image), or this workflow.
+name: Dev container
+
+on:
+  pull_request:
+    paths:
+      - .devcontainer/**
+      - rust-toolchain.toml
+      - .config/tool-versions.toml
+      - scripts/install-tools.sh
+      - .github/workflows/devcontainer.yml
+  push:
+    branches: [main]
+    paths:
+      - .devcontainer/**
+      - rust-toolchain.toml
+      - .config/tool-versions.toml
+      - scripts/install-tools.sh
+      - .github/workflows/devcontainer.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: just check in the dev container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          runCmd: just check

@@ -20,6 +20,10 @@ Every build, test and agent session runs inside the dev container (ADR-0006). Fr
 - `just dev-serve`, `just dev-claude`, `just inspect`: run the binary against the dev brain in `.dev/`, never the owner's real brain. Run `latens` only through these.
 - `just dev-reset`: wipe the dev brain.
 
+Docs name recipes and never copy their commands; CI fails a PR whose `AGENTS.md` or README names a recipe that doesn't exist (`scripts/check-recipes.sh`).
+
+CI runs natively on Linux and macOS, not in the container. A separate workflow runs `just check` in the dev container, only when the environment changes. Workflows use only first-party actions, pinned by full commit SHA (ADR-0007).
+
 The versions of `just`, `cargo-nextest` and `cargo-deny` live only in `.config/tool-versions.toml`; the Rust version lives only in `rust-toolchain.toml`. A pin bump is its own PR.
 
 ## Pull requests

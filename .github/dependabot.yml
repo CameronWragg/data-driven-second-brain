@@ -1,0 +1,23 @@
+# Dependabot bumps what it understands (ADR-0007). .config/tool-versions.toml
+# and rust-toolchain.toml are bumped by hand, each in its own PR.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: devcontainers
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /.devcontainer
+    schedule:
+      interval: weekly
