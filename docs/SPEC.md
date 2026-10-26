@@ -201,7 +201,7 @@ All changes go through the `write` tool as a **batch** of operations. A batch is
 
 Every check runs on every operation, and a rejection reports **all** problems at once, each with its operation index and check.
 
-1. **Schema:** required fields are present, the Kind's required sections exist, a `create` has an `about` Link, and every referenced ID exists.
+1. **Schema:** required fields are present, the Kind's required sections exist, a `create` has an `about` Link, every referenced ID exists, and `body` is at most 8,000 characters (on `create`, `update` and a `supersede` replacement). The size problem says to split the Recollection into several linked with `relates-to`. The cap keeps one idea per Recollection and any single item well inside `get`'s budget (§14.4); it is not tied to the embedding model. A hand-edited file over the cap is indexed as normal.
 2. **Secrets:** the secret detector (§5.4) finds nothing in the operation's free text that the owner hasn't allowlisted.
 3. **Concurrency:** each `version` matches the file on disk.
 4. **Duplicates** (on `create` and on a `supersede` replacement, for operations that passed the schema check): the brain looks for existing Recollections that share an Entity or Anchor *and* have Similarity above a threshold. It leaves out the Recollection being superseded and any the new one already Links with `relates-to`; such a Link counts as distinct.
@@ -271,20 +271,22 @@ If the configured model differs from the one recorded, the brain rebuilds every 
 
 ### 6.2 Preprocessing before embedding
 
-1. **Context prefix:** Kind, the names of linked Entities, and the Repository, e.g. `caveat · Dependency: npm:prisma · Repository: api ·`.
+1. **Context prefix:** Kind, the names of the first 5 linked Entities (in `links` order; the rest are left out without a marker), and the Repository, e.g. `caveat · Dependency: npm:prisma · Repository: api ·`.
 2. **Text:** title + summary + body. Markdown formatting is stripped and whitespace collapsed, but identifiers and paths are kept.
-3. **Model labels:** the model's document label (`search_document:` / `passage:`) on stored text, and its query label on queries.
+3. **Model labels:** the model's document label (e.g. `search_document:` / `passage:`) on stored text, and its query label on queries. The default model, bge-small-en-v1.5, has no document label; its query label is `Represent this sentence for searching relevant passages: `.
 4. **Hash check:** the hash of the final text is stored. If it hasn't changed, the brain skips embedding.
 
-Each Entity gets one embedding, built from its name and description. Each Recollection gets one embedding, with no chunking.
+Each Entity gets one embedding, built from its name and description. Each Recollection gets one embedding; it is never chunked.
+
+**Long text is truncated from the end.** The model embeds only what fits its input window (512 tokens for bge-small, roughly 1,500–2,000 characters of prose, fewer for identifier-heavy text). Because the prefix, title and summary come first, only the tail of the body is ever cut. The cut text is still matched by keyword search, since FTS5 indexes the full text and ranking fuses both (§6.4). A `write` that produces truncated text warns about it (§14.5). Duplicate checks (§5.2) compare the truncated embeddings with no special case: two Recollections that open the same way are usually duplicates, and the decision table covers those that aren't.
 
 For keyword search, the FTS5 table indexes both the original text and a version with identifiers split (`getUserById` → `get user by id`).
 
 ### 6.3 Embedding provider
 
-The provider is a trait. The default implementation is a local ONNX model, chosen using the test set (§13); candidates include bge-small-en-v1.5, nomic-embed-text-v1.5 and EmbeddingGemma. An API-backed provider can be swapped in later.
+The provider is a trait. Besides embedding, it reports its input limit and counts the tokens of a text, so the brain knows when text is truncated (§6.2). The default implementation is a local ONNX model, chosen using the test set (§13); candidates include bge-small-en-v1.5, nomic-embed-text-v1.5 and EmbeddingGemma. An API-backed provider can be swapped in later.
 
-A second built-in provider, `hash`, needs no model: it feature-hashes the preprocessed tokens (identifiers split) into fixed-dimension unit vectors, so overlapping text scores as similar. It is deterministic and its quality is deliberately poor, and is selected with `embedding.provider = "hash"` (§17.1). It is documented for use where the ONNX model can't run, and it is what the test suite uses (§16).
+A second built-in provider, `hash`, needs no model: it feature-hashes the preprocessed tokens (identifiers split) into fixed-dimension unit vectors, so overlapping text scores as similar. It is deterministic, has no input limit (it never truncates), and its quality is deliberately poor, and is selected with `embedding.provider = "hash"` (§17.1). It is documented for use where the ONNX model can't run, and it is what the test suite uses (§16).
 
 ### 6.4 Search
 
@@ -425,7 +427,7 @@ Several `serve` processes can share one brain. `.index/lock` is an exclusive `fl
 
 ## 13. Retrieval test set
 
-`eval/queries.yaml` lists queries, each with the Recollection IDs it should find and an optional scope. `latens eval` reports recall@5, recall@10 and mean reciprocal rank (MRR). It's used to choose the embedding model, check that preprocessing helps, and catch search getting worse. This repo also includes a small fixture brain with its own test set for CI, and its scores are committed in `eval/baseline.json`. CI fails if recall@5, recall@10 or MRR drops more than 0.02 below the baseline; changes to the model, preprocessing or ranking update the baseline in the same PR (§16.4).
+`eval/queries.yaml` lists queries, each with the Recollection IDs it should find and an optional scope. `latens eval` reports recall@5, recall@10 and mean reciprocal rank (MRR). It's used to choose the embedding model, check that preprocessing helps, and catch search getting worse. It includes at least one long Recollection that a query matches only on text past the model's input window, so it shows keyword search covering truncation (§6.2). This repo also includes a small fixture brain with its own test set for CI, and its scores are committed in `eval/baseline.json`. CI fails if recall@5, recall@10 or MRR drops more than 0.02 below the baseline; changes to the model, preprocessing or ranking update the baseline in the same PR (§16.4).
 
 ## 14. MCP tools
 
@@ -477,7 +479,7 @@ Budgets are constants in code, not owner configuration. They keep every result u
 
 ### 14.5 `write` results
 
-**Success** lists, per operation, an outcome line with any new IDs (and the refs they replace) and the new `version` of every file touched, then warnings (Anchors on uncommitted lines, Anchors relocated), then the commit SHA. The push runs in the background, so there is no push outcome; a `Sync:` line appears only when the last sync didn't succeed (§10.1).
+**Success** lists, per operation, an outcome line with any new IDs (and the refs they replace) and the new `version` of every file touched, then warnings (Anchors on uncommitted lines, Anchors relocated, Recollections whose embedded text was truncated), then the commit SHA. A truncation warning names the Recollection and roughly how many characters of the body were embedded, notes that the rest is matched by keyword only, and suggests splitting it (§6.2). The push runs in the background, so there is no push outcome; a `Sync:` line appears only when the last sync didn't succeed (§10.1).
 
 **Rejection** lists every problem from §5.2 with its operation index and check, and for duplicates the candidates and decision table.
 
