@@ -24,22 +24,30 @@ There is one binary, `latens`, with these subcommands. The same name is used for
 
 **Startup sequence (`serve`):**
 1. Open the index (SQLite, WAL mode).
-2. Take the write lock (§11), then:
-   1. Commit any uncommitted changes in the brain folder with an `Author: owner` trailer (§10).
-   2. Pull from the remote, rebasing local commits.
+2. **Recover**, under the write lock (§11), then release it. These steps are local and fast:
+   1. Clear git state a killed process left behind (§10.2).
+   2. Replay the write journal, if one is left (§5.3).
+   3. Commit any other uncommitted changes in the brain folder with an `Author: owner` trailer (§10).
+3. **Sync** (§10.1), which also does the startup maintenance:
+   1. Fetch from the remote, without the lock.
+   2. Take the write lock and rebase local commits onto the fetched head.
    3. Check the brain format (§17.2). If it is newer than this binary supports, stop here: no further maintenance and no push, and every tool returns `incompatible`. If it is older, bump it.
-   4. Re-index any file whose content hash differs from the index, which picks up the pull and hand edits. Every file passes through the migration chain on its way in (§17.3); if the index was built at a different format, it is rebuilt from every file.
+   4. Re-index any file whose content hash differs from the index, which picks up the rebase and hand edits. Every file passes through the migration chain on its way in (§17.3); if the index was built at a different format, it is rebuilt from every file.
    5. Delete Recollections that have been `abandoned` for more than 14 days.
-   6. Push any unpushed commits.
+   6. Push any unpushed commits, then release the lock.
 
-With no remote (§10), the pull and push are skipped.
-3. Detect the **Checkout** from the working directory, which gives the Repository and Branch.
-4. If any manifest hash differs from the last scan, run the scanner (§7).
-5. Detect the Branch lifecycle for the current Repository (§9.1). This needs the network and is skipped quietly when offline.
+   With no remote (§10), the fetch, rebase and push are skipped; the rest still runs under the lock.
+4. Detect the **Checkout** from `CLAUDE_PROJECT_DIR` when it is set, otherwise from the working directory, which gives the Repository and Branch.
+5. If any manifest hash differs from the last scan, run the scanner (§7).
+6. Detect the Branch lifecycle for the current Repository (§9.1). This needs the network and is skipped quietly when offline.
 
-All network steps are best-effort: when offline, the brain carries on with local data and reports this through `context`.
+All network steps are best-effort and bounded by `sync.timeout` (§17.1): a failure or timeout counts as offline, and the brain carries on with local data and reports this through `context`.
 
-**Shutdown:** push any unpushed commits.
+**Staying up.** Claude Code does not restart a stdio server mid-session, so `serve` exits only on shutdown. Each tool call runs isolated: a panic becomes an `internal` error (§14.6), not a crash. A broken or mismatched index is rebuilt from files. A failed startup step leaves `serve` running and is reported through `context`; tools that need that step say so.
+
+**Shutdown.** On stdin EOF, `SIGINT`, `SIGTERM` or `SIGHUP` (handled explicitly; rmcp installs no handlers), `serve` stops accepting tool calls, lets a `write` batch that has passed its checks finish its local commit, kills any running `git` network command, releases the lock and exits, within 100 ms. Claude Code sends `SIGTERM` 100 ms after `SIGINT` and `SIGKILL` 400 ms after that, without closing stdin, so shutdown does no network work and nothing depends on it running: the push after each `write` (§10.1) and recovery at startup cover a killed process.
+
+**Child processes.** `serve` runs `git` (and `gh`) as child processes, and none may outlive it for long (ADR-0005). On Linux every child gets `PR_SET_PDEATHSIG(SIGKILL)`. macOS has no equivalent, so a child's lifetime is bounded by `sync.timeout`. Every `git` child that touches the brain repository inherits the write lock's file descriptor, so the lock stays held until the last such child exits, and a fresh `serve` never recovers git state while an orphaned `git` is still using it.
 
 ## 3. Brain folder
 
@@ -223,7 +231,9 @@ Author: agent
 
 `Author` is `agent` for a `write` batch, `owner` for hand edits committed at startup (§10), and `server` for commits the binary makes on its own: scanner changes, deleting abandoned Recollections, and migrations (§17.3).
 
-Pushing is separate and explicit (§10).
+**The write journal.** A batch must commit whole even if `serve` is killed part-way. Under the lock, before touching any file, `serve` writes `.index/journal` holding the full new content of every file, the paths to delete and the commit message, and fsyncs it. It then writes the files, updates the index, commits, and deletes the journal. A journal found at startup (§2) is rolled forward: every file is rewritten from it and committed with its message. Replaying is idempotent, so the batch lands exactly as the Agent was told it did, with its own `Author` and trailers rather than as an owner hand edit.
+
+A successful batch starts a push in the background (§10.1); the `write` result doesn't wait for it.
 
 ## 6. Index and search
 
@@ -350,14 +360,40 @@ The Promotion is complete once no `active` Recollections remain on the merged Br
 ## 10. Git, sync and hand edits
 
 - The brain uses the system `git` command, so the owner's existing git credentials apply.
-- Each batch is one commit (§5). Pushes happen on `push`, at shutdown, and at startup (to catch a missed shutdown push). There is no timer.
-- Before pushing, the brain pulls with `--rebase`. Conflicts are rare because each Recollection has its own file. If a rebase does conflict, the brain aborts it and reports the conflict through `context`.
+- Each batch is one commit (§5). Pushes happen in the background after every successful `write` batch, at startup (to catch anything a killed process left unpushed), and on an explicit `push`. There is no push at shutdown and no timer.
 - **The remote** is the brain repository's own `origin`, never a configuration key. A brain with no remote (`latens init --no-remote`, §12) is a normal state: pulls and pushes are skipped, and `context` reports "no remote" as status rather than as a sync problem.
 - **Hand edits:** uncommitted changes found at startup are committed with `Author: owner`. A file that fails the schema checks (§5) is still indexed as-is, and `context` lists it as needing repair.
 
+### 10.1 The sync sequence
+
+Startup (§2 step 3), the background push and the `push` tool all run the same sequence:
+1. `git fetch`, **without** the write lock, so a slow or hanging remote never makes other writers return `busy`.
+2. Take the lock, `rebase` local commits onto the fetched head, check the brain format (§17.2; a newer one stops the sequence, nothing is pushed, and `serve` switches to `incompatible`), and re-index the files the rebase changed.
+3. Push, still under the lock, so no new commit slips in underneath it, then release the lock.
+4. If the push is rejected because the remote moved on, run the sequence once more, then give up until the next trigger.
+
+Each network step is bounded by `sync.timeout`, and a timeout counts as offline.
+
+**Background pushes** run one at a time per `serve`. A batch that commits while a push is running marks one more push as wanted, so a burst of writes gives at most two pushes. A background push skips the abandoned-Recollection cleanup, which runs only at startup.
+
+**Conflicts.** Conflicts are rare because each Recollection has its own file, so one means the same file was changed on two machines. The brain aborts the rebase, keeps its local commits unpushed, and records the conflict. In v1 the owner resolves it by hand in the brain folder; `context` names the files and says how. Background and startup pushes don't retry against the remote head they last conflicted with; an explicit `push` always tries.
+
+**Sync status.** `.index/sync.json` (git-ignored and derived, so losing it is harmless) records the last attempt's time and result (`ok`, `offline`, `conflict` with its files and the remote head, `rejected`, or `error` with its text) and the unpushed count. Every sync writes it under the lock, so every `serve` sharing the brain sees the same status:
+- `context` always shows one sync line: `synced`, `no remote`, offline with the unpushed count, a conflict with its files and how to resolve it, or a repository needing repair. Anything but `synced` or `no remote` also goes on its to-do line.
+- A `write` result shows a `Sync:` line only when the last result wasn't `ok`, e.g. `Sync: offline since 14:02, 3 commits unpushed`.
+
+### 10.2 Recovering from a killed process
+
+A `serve` may be `SIGKILL`ed at any point, so the recovery step (§2 step 2) runs under the write lock before anything else touches git. Holding the lock means no `git` child of any `serve` is still running (§2, child processes), so anything git left behind is stale:
+- Lock files under `.git/` (`index.lock`, `packed-refs.lock`, `shallow.lock`, `config.lock`, `refs/**/*.lock`) are removed.
+- A rebase, merge, cherry-pick or revert still in progress is aborted, which leaves the local commits as they were; the next sync tries again.
+- If an abort fails because the repository is broken, this `serve` skips sync entirely, keeps serving reads and writes locally, and `context` reports that the brain repository needs repair, with git's error.
+
+We accept the small risk that the owner runs `git` by hand in the brain folder at the moment a `serve` starts.
+
 ## 11. Concurrency
 
-Several `serve` processes can share one brain. `.index/lock` is an exclusive file lock. It's held for the startup maintenance steps and for each "write files → update index → commit" sequence, and other writers wait for it with a timeout. The timeout is a configuration value (`lock.timeout`, §17.1), so tests can make it short. Reads never take the lock; WAL mode keeps them consistent.
+Several `serve` processes can share one brain. `.index/lock` is an exclusive `flock`, so `git` children that inherit its descriptor keep it held (§2). It's held for the startup recovery steps, for the local part of every sync (rebase, re-index, maintenance, push; never the fetch, §10.1), and for each "write journal → write files → update index → commit" sequence, and other writers wait for it with a timeout. The timeout is a configuration value (`lock.timeout`, §17.1), so tests can make it short. Reads never take the lock; WAL mode keeps them consistent.
 
 ## 12. `latens init`
 
@@ -384,7 +420,7 @@ Several `serve` processes can share one brain. `.index/lock` is an exclusive fil
 | `promotion` | `branch?` (default: the oldest pending Promotion in the current Repository) | A Promotion plan (§9.3) as summaries |
 | `scan` | — | Counts of Entities and Links added, changed and removed, then up to 20 named changes and "+N more" |
 | `history` | `id`, `commit?` | Without `commit`: up to 20 commits for the item, newest first (short SHA, date, `Action`, `Author`, subject), found by trailer, including superseded and deleted items. With `commit`: the file as it was at that commit |
-| `push` | — | Push result |
+| `push` | — | Waits for any background push in this `serve`, then runs the sync sequence (§10.1) at once: `pushed N commits to origin/<branch>`, `up to date`, `no remote`, or an `offline` or `sync_conflict` error |
 
 Tool names carry no prefix; clients add their own (Claude Code shows `mcp__latens__search`).
 
@@ -421,7 +457,7 @@ Budgets are constants in code, not owner configuration. They keep every result u
 
 ### 14.5 `write` results
 
-**Success** lists, per operation, an outcome line with any new IDs (and the refs they replace) and the new `version` of every file touched, then warnings (Anchors on uncommitted lines, Anchors relocated), then the commit SHA.
+**Success** lists, per operation, an outcome line with any new IDs (and the refs they replace) and the new `version` of every file touched, then warnings (Anchors on uncommitted lines, Anchors relocated), then the commit SHA. The push runs in the background, so there is no push outcome; a `Sync:` line appears only when the last sync didn't succeed (§10.1).
 
 **Rejection** lists every problem from §5.2 with its operation index and check, and for duplicates the candidates and decision table.
 
@@ -436,6 +472,9 @@ Domain failures are tool results with `isError: true`; JSON-RPC errors are only 
 | `not_found` | An ID passed to `get`, `history` or `promotion` doesn't exist |
 | `busy` | The startup sequence or the write lock didn't finish within the timeout |
 | `incompatible` | The brain's format is newer than this binary supports (§17.2); names both versions and says to upgrade. Every tool returns it |
+| `offline` | `push` couldn't reach the remote within `sync.timeout`; gives the unpushed count |
+| `sync_conflict` | `push` hit a rebase conflict (§10.1); names the files and how to resolve them. Distinct from `conflict`, which is a stale `version` |
+| `internal` | A bug: the call panicked. `serve` keeps running (§2) |
 
 ### 14.7 Agent guidance
 
@@ -542,7 +581,8 @@ Integration tests drive the real binary over MCP stdio using rmcp's client.
 - **Harness:** every test goes through a `TestBrain` harness that gives it a fresh tempdir as `HOME` and `XDG_*`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` set to `/dev/null`, a fixed git author, a controlled `PATH` and the model cache. No test reaches the owner's brain, git credentials, `gh` login or the network.
 - **Remotes:** local bare repos added by path. A second clone plays another machine (concurrent pushes, rebase conflicts, deleted Branches). Network loss is simulated by renaming the bare repo away; any failed remote step is treated as offline (§2).
 - **Concurrency:** two or three real `serve` processes share one brain with a short lock timeout (§11). Each either waits its turn or returns `busy`.
-- **Crash recovery:** `serve` is SIGKILLed after a `write` and while it holds the lock during startup maintenance. A fresh `serve` must lose nothing, find the lock free, and push what was unpushed.
+- **Crash recovery:** `serve` is SIGKILLed after a `write`, between a batch's journal and its commit, during a background push, and while it holds the lock during startup maintenance. A fresh `serve` must lose nothing, commit a journalled batch with its own trailers (never as `Author: owner`), find the lock free, clear stale git locks and rebases, and push what was unpushed.
+- **Shutdown:** after `SIGINT`, `SIGTERM`, `SIGHUP` or stdin EOF, `serve` exits within 100 ms, even with a push hanging on an unreachable remote.
 - **Scanner:** `tests/fixtures/checkouts/<case>/` holds real manifest and lockfile sets for every row of §7.2, plus a workspace, a git dependency, a path dependency and a version that can't be parsed. They are copied into a temp Checkout and `git init`ed.
 - **Format upgrades:** `tests/fixtures/brains/v<N>/` holds a small, realistic brain frozen at every format version that has shipped, starting with `v1` when M1 lands; each format bump adds the previous version's fixture. A test copies each one, runs `serve`, and checks the migrated files (snapshots), the single `migrate` commit, and that a second start changes nothing. Another writes `format = <current + 1>` and asserts every tool returns `incompatible`.
 - **Output:** tool output is checked with `insta` snapshots, with ULIDs, hashes and timestamps redacted. Error codes, files on disk and git history get plain assertions.
@@ -571,6 +611,7 @@ XDG locations are used on macOS as well as Linux (`~/.config`, `~/.local/share`,
 | `duplicates.threshold` | per model, in code | Similarity above which a `create` is checked as a duplicate (§5.2); tuned with `latens eval` |
 | `lock.timeout` | in code | How long a writer waits for the write lock (§11), as a duration string such as `"200ms"` |
 | `startup.timeout` | in code | How long a tool call waits for the startup sequence before returning `busy` (§2) |
+| `sync.timeout` | about 30 s | The limit on each `git` network step (§10.1) and so on how long an orphaned `git` child can live on macOS (§2); a timeout counts as offline |
 
 Everything else is a constant in code, including the output budgets (§14.4) and the 14-day abandonment window (§9.2): deleted Recollections stay reachable through git and `history`, so a longer window buys little. The remote is not configuration (§10).
 
@@ -578,7 +619,7 @@ Everything else is a constant in code, including the output budgets (§14.4) and
 
 `brain.toml`, committed in the brain folder, records the brain's format version as one brain-wide integer (`format = 1`); files carry no version of their own. Any change to the schema of the files bumps it, even an additive one, because strict parsing makes an older binary reject fields it doesn't know. A bump whose migration changes nothing is fine.
 
-At startup, after the pull (§2):
+At startup and on every sync, after the rebase (§2, §10.1):
 - **A newer format** than this binary supports: `serve` still answers the handshake, but stops maintenance and doesn't push, so it never spreads files in an older shape. Every tool returns `incompatible` (§14.6), naming both versions and saying to upgrade.
 - **An older format:** the binary bumps `brain.toml` and migrates (§17.3).
 
