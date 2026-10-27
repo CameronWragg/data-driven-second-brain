@@ -1,0 +1,22 @@
+---
+source: tests/serve.rs
+assertion_line: 685
+expression: text
+---
+rejected: the batch failed its checks, so nothing was written
+- operation 0 (concurrency): conflict: [ULID] has changed since version [VERSION]; its current version is [VERSION]
+- operation 0 (schema): `summary` is empty
+- operation 1 (schema): a decision needs a `## Context` section in its body
+- operation 1 (schema): a decision needs a `## Decision` section in its body
+- operation 1 (schema): a decision needs a `## Why` section in its body
+- operation 2 (schema): no Recollection has the ID [ULID]
+- operation 3 (schema): dep:npm:prisma is an Entity, not a Recollection
+- operation 4 (schema): ref:later names no `ref` given by an earlier operation in this batch
+- operation 5 (schema): [ULID] can't Link to itself
+- operation 6 (schema): only a `depends-on` Link carries a `version`, and those start from a Repository
+- operation 6 (schema): [ULID] already has the `about` Link to dep:npm:prisma
+- operation 7 (schema): dep:npm:prisma is an Entity; `link` and `unlink` work only from Recollections for now
+- operation 8 (schema): [ULID] would have no `about` Link left; a Recollection needs at least one
+- operation 9 (schema): [ULID] has no `relates-to` Link to dep:npm:prisma
+- operation 10 (schema): the replacement can't Link to [ULID], which it supersedes
+`get` each changed Recollection again, redo your change on its current text, fix every other problem above and send the whole batch again.

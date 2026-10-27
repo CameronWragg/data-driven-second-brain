@@ -1,0 +1,7 @@
+---
+source: tests/serve.rs
+assertion_line: 420
+expression: text
+---
+0. deleted caveat [ULID] "Prisma migrations fail silently"
+Commit: [SHA]

@@ -1,0 +1,14 @@
+---
+source: tests/serve.rs
+assertion_line: 594
+expression: text
+---
+rejected: the batch failed its checks, so nothing was written
+- operation 0 (schema): `created` is filled in by the server; leave it out
+- operation 0 (schema): `id` is filled in by the server; leave it out
+- operation 0 (schema): `mood` isn't a field of `create`
+- operation 0 (schema): `state` is filled in by the server; leave it out
+- operation 1 (schema): `branch` is filled in by the server; leave it out
+- operation 1 (schema): `supersedes` is filled in by the server; leave it out
+- operation 1 (schema): `updated` is filled in by the server; leave it out
+Fix every problem above and send the whole batch again.

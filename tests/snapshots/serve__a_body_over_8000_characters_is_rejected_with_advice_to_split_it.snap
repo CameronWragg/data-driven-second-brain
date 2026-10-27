@@ -1,0 +1,9 @@
+---
+source: tests/serve.rs
+assertion_line: 624
+expression: text
+---
+rejected: the batch failed its checks, so nothing was written
+- operation 1 (schema): `body` is 8001 characters, over the limit of 8000; split it into several Recollections, one idea each, linked with `relates-to`
+- operation 2 (schema): `body` is 9000 characters, over the limit of 8000; split it into several Recollections, one idea each, linked with `relates-to`
+Fix every problem above and send the whole batch again.

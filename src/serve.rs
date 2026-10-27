@@ -12,13 +12,14 @@ use rmcp::model::{
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use ulid::Ulid;
 
 use crate::brain::Brain;
 use crate::config::{Config, Dirs};
 use crate::get::{self, Found};
 use crate::lock::{self, LockError};
-use crate::recollection::Kind;
-use crate::write::{self, Operation, WriteError, Written};
+use crate::recollection::{Kind, Link};
+use crate::write::{self, Change, Check, Operation, WriteError, Written};
 
 /// The server instructions (SPEC §14.7), which Claude Code cuts at 4,096
 /// characters.
@@ -204,7 +205,11 @@ impl Server {
     /// Save, record or remember knowledge in the Second Brain as a batch of
     /// operations, committed together or not at all. `create` makes a
     /// Recollection of a Kind with a title, a one-line summary, a Markdown
-    /// body and an `about` Link to an Entity.
+    /// body and an `about` Link to an Entity. `update`, `supersede`, `delete`,
+    /// `link` and `unlink` change an existing one and need the `version` you
+    /// last saw, even when an earlier operation in the batch changes it too.
+    /// A `create` can carry a `ref` that later operations name as
+    /// `ref:<name>` in a Link's `to`.
     #[tool(annotations(destructive_hint = true))]
     async fn write(&self, Parameters(params): Parameters<WriteParams>) -> CallToolResult {
         let brain = self.brain.clone();
@@ -327,23 +332,56 @@ fn truncated(item: &get::Item) -> String {
 
 fn render_written(written: &Written) -> String {
     let mut text = String::new();
-    for (index, created) in written.created.iter().enumerate() {
+    for (index, outcome) in written.outcomes.iter().enumerate() {
+        let (kind, id, title) = (outcome.kind.as_str(), outcome.id, &outcome.title);
+        let item = format!("{kind} {id} \"{title}\"");
+        let (line, reference) = match &outcome.change {
+            Change::Created { reference } => (format!("created {item}"), reference.as_ref()),
+            Change::Updated => (format!("updated {item}"), None),
+            Change::Superseded { old, reference } => {
+                (format!("superseded {old} with {item}"), reference.as_ref())
+            }
+            Change::Linked(link) => (format!("linked {item} {}", link_text(link)), None),
+            Change::Unlinked(link) => (format!("unlinked {item} {}", link_text(link)), None),
+            Change::Deleted => {
+                text.push_str(&format!("{index}. deleted {item}\n"));
+                continue;
+            }
+        };
+        let reference = match reference {
+            Some(reference) => format!("ref {reference}, "),
+            None => String::new(),
+        };
         text.push_str(&format!(
-            "{index}. created {} {} \"{}\" (version {})\n",
-            created.kind.as_str(),
-            created.id,
-            created.title,
-            created.version
+            "{index}. {line}{}\n",
+            version_note(written, id, &reference)
         ));
     }
     text.push_str(&format!("Commit: {}\n", written.commit));
     text
 }
 
+/// A Link as a result line names it: its type, then where it points.
+fn link_text(link: &Link) -> String {
+    format!("{} {}", link.link_type.as_str(), link.to)
+}
+
+/// The new version of Recollection `id` after the whole batch, or that a
+/// later operation deleted it, after `prefix`.
+fn version_note(written: &Written, id: Ulid, prefix: &str) -> String {
+    match written.versions.get(&id) {
+        Some(version) => format!(" ({prefix}version {version})"),
+        None => format!(" ({prefix}deleted later in this batch)"),
+    }
+}
+
 fn write_error(error: WriteError) -> ToolError {
     match error {
         WriteError::Rejected(problems) => {
             let mut message = String::from("the batch failed its checks, so nothing was written");
+            let conflict = problems
+                .iter()
+                .any(|problem| problem.check == Check::Concurrency);
             for problem in problems {
                 let at = match problem.index {
                     Some(index) => format!("operation {index}"),
@@ -357,7 +395,13 @@ fn write_error(error: WriteError) -> ToolError {
             ToolError {
                 code: "rejected",
                 message,
-                next: "Fix every problem above and send the whole batch again.".into(),
+                next: if conflict {
+                    "`get` each changed Recollection again, redo your change on its current \
+                     text, fix every other problem above and send the whole batch again."
+                } else {
+                    "Fix every problem above and send the whole batch again."
+                }
+                .into(),
             }
         }
         WriteError::Lock(timeout @ LockError::Timeout(_)) => ToolError {

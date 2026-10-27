@@ -5,6 +5,8 @@ mod common;
 use std::fs;
 
 use common::{PRISMA, PRISMA_PATH, TestBrain, call, redacted};
+use rmcp::RoleClient;
+use rmcp::service::RunningService;
 use serde_json::json;
 
 #[tokio::test]
@@ -303,5 +305,438 @@ async fn write_returns_busy_when_the_lock_stays_held_past_lock_timeout() {
     )
     .await;
     assert!(!is_error, "{text}");
+    client.cancel().await.unwrap();
+}
+
+/// A brain holding the Prisma Entity, committed, with `latens serve`
+/// connected to it.
+async fn serving_prisma(test: &TestBrain) -> RunningService<RoleClient, ()> {
+    let brain = test.init();
+    test.place_entity(PRISMA_PATH, PRISMA);
+    test.git(&brain, &["add", "."]);
+    test.git(&brain, &["commit", "--quiet", "--message", "Add Prisma"]);
+    test.serve().await
+}
+
+/// Runs a `write` batch that must succeed, returning its text.
+async fn write_ok(
+    client: &RunningService<RoleClient, ()>,
+    operations: serde_json::Value,
+) -> String {
+    let (is_error, text) = call(client, "write", json!({ "operations": operations })).await;
+    assert!(!is_error, "{text}");
+    text
+}
+
+/// The ID and version on line `line` of a `write` result: the ID is the
+/// one just before the quoted title.
+fn id_and_version(written: &str, line: usize) -> (String, String) {
+    let line = written.lines().nth(line).unwrap();
+    let id = line
+        .split('"')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap();
+    let version = line
+        .rsplit("version ")
+        .next()
+        .unwrap()
+        .trim_end_matches(')');
+    (id.to_owned(), version.to_owned())
+}
+
+/// Creates one Prisma caveat titled `title`, returning its ID and version.
+async fn create_caveat(client: &RunningService<RoleClient, ()>, title: &str) -> (String, String) {
+    id_and_version(&write_ok(client, json!([prisma_caveat(title)])).await, 0)
+}
+
+/// A Recollection's file in the default brain.
+fn recollection_file(test: &TestBrain, id: &str) -> std::path::PathBuf {
+    test.default_brain().join(format!("recollections/{id}.md"))
+}
+
+#[tokio::test]
+async fn update_patches_only_the_fields_it_is_given_and_replaces_lists_whole() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (id, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+
+    let text = write_ok(
+        &client,
+        json!([{
+            "op": "update",
+            "id": id,
+            "version": version,
+            "title": "Prisma migrate dev needs a shadow database",
+            "tags": ["prisma", "shadow-database"],
+        }]),
+    )
+    .await;
+
+    redacted().bind(|| insta::assert_snapshot!(text));
+    let file = fs::read_to_string(recollection_file(&test, &id)).unwrap();
+    redacted().bind(|| insta::assert_snapshot!(file));
+    let message = test.git(&test.default_brain(), &["log", "-1", "--format=%B"]);
+    redacted().bind(|| insta::assert_snapshot!(message));
+    client.cancel().await.unwrap();
+}
+
+/// The `create` fields of a Prisma caveat, as a `supersede` replacement.
+fn replacement(title: &str) -> serde_json::Value {
+    let mut fields = prisma_caveat(title);
+    fields.as_object_mut().unwrap().remove("op");
+    fields
+}
+
+#[tokio::test]
+async fn supersede_creates_the_replacement_records_supersedes_and_deletes_the_old_file() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (old, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+
+    let text = write_ok(
+        &client,
+        json!([{
+            "op": "supersede",
+            "id": old,
+            "version": version,
+            "replacement": replacement("Prisma 5 warns when the shadow database is missing"),
+        }]),
+    )
+    .await;
+
+    redacted().bind(|| insta::assert_snapshot!(text));
+    let (new, _) = id_and_version(&text, 0);
+    assert!(!recollection_file(&test, &old).exists());
+    let file = fs::read_to_string(recollection_file(&test, &new)).unwrap();
+    assert!(file.contains(&format!("supersedes:\n- {old}\n")), "{file}");
+    let brain = test.default_brain();
+    let files = test.git(
+        &brain,
+        &["show", "--name-status", "--no-renames", "--format=", "HEAD"],
+    );
+    assert_eq!(
+        files,
+        format!("D\trecollections/{old}.md\nA\trecollections/{new}.md\n")
+    );
+    let message = test.git(&brain, &["log", "-1", "--format=%B"]);
+    redacted().bind(|| insta::assert_snapshot!(message));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn delete_removes_the_file_in_one_commit() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (id, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+
+    let text = write_ok(
+        &client,
+        json!([{ "op": "delete", "id": id, "version": version }]),
+    )
+    .await;
+
+    redacted().bind(|| insta::assert_snapshot!(text));
+    assert!(!recollection_file(&test, &id).exists());
+    let brain = test.default_brain();
+    assert_eq!(
+        test.git(&brain, &["show", "--name-status", "--format=", "HEAD"]),
+        format!("D\trecollections/{id}.md\n")
+    );
+    assert_eq!(test.git(&brain, &["status", "--porcelain"]), "");
+    let message = test.git(&brain, &["log", "-1", "--format=%B"]);
+    redacted().bind(|| insta::assert_snapshot!(message));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn link_and_unlink_change_the_links_of_the_file_they_start_from() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (from, from_version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let (to, _) = create_caveat(&client, "Prisma needs a shadow database").await;
+
+    let linked = write_ok(
+        &client,
+        json!([{
+            "op": "link",
+            "from": from,
+            "type": "relates-to",
+            "to": to,
+            "from_version": from_version,
+        }]),
+    )
+    .await;
+    let file = fs::read_to_string(recollection_file(&test, &from)).unwrap();
+    let (_, linked_version) = id_and_version(&linked, 0);
+    let unlinked = write_ok(
+        &client,
+        json!([{
+            "op": "unlink",
+            "from": from,
+            "type": "relates-to",
+            "to": to,
+            "from_version": linked_version,
+        }]),
+    )
+    .await;
+
+    redacted().bind(|| insta::assert_snapshot!(format!("{linked}{unlinked}")));
+    assert!(
+        file.contains(&format!("- type: relates-to\n  to: {to}\n")),
+        "{file}"
+    );
+    let file = fs::read_to_string(recollection_file(&test, &from)).unwrap();
+    assert!(!file.contains("relates-to"), "{file}");
+    let message = test.git(&test.default_brain(), &["log", "-1", "--format=%B"]);
+    redacted().bind(|| insta::assert_snapshot!(message));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stale_version_rejects_the_batch_with_conflict_and_the_current_version() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (id, stale) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let file = recollection_file(&test, &id);
+    let edited = fs::read_to_string(&file).unwrap() + "\nA hand edit.\n";
+    fs::write(&file, &edited).unwrap();
+    let (_, got) = call(&client, "get", json!({ "ids": [id] })).await;
+    let current = got
+        .split("version=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+
+    let (is_error, text) = call(
+        &client,
+        "write",
+        json!({ "operations": [
+            { "op": "update", "id": id, "version": stale, "title": "Changed" },
+            { "op": "delete", "id": id, "version": current },
+        ] }),
+    )
+    .await;
+
+    assert!(is_error, "{text}");
+    assert!(text.starts_with("rejected:"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "operation 0 (concurrency): conflict: {id} has changed since version {stale}; its current version is {current}"
+        )),
+        "{text}"
+    );
+    redacted().bind(|| insta::assert_snapshot!(text));
+    assert_eq!(fs::read_to_string(&file).unwrap(), edited);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_ref_names_a_new_recollection_to_later_operations_and_the_result_maps_it() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (existing, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let mut first = prisma_caveat("Prisma needs a shadow database");
+    first["ref"] = json!("shadow");
+    let mut second = prisma_caveat("Prisma's shadow database must be empty");
+    second["links"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "type": "relates-to", "to": "ref:shadow" }));
+
+    let text = write_ok(
+        &client,
+        json!([
+            first,
+            second,
+            {
+                "op": "link",
+                "from": existing,
+                "type": "relates-to",
+                "to": "ref:shadow",
+                "from_version": version,
+            },
+        ]),
+    )
+    .await;
+
+    redacted().bind(|| insta::assert_snapshot!(text));
+    let (shadow, _) = id_and_version(&text, 0);
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .contains("(ref shadow, version ")
+    );
+    let (second, _) = id_and_version(&text, 1);
+    for id in [second, existing] {
+        let file = fs::read_to_string(recollection_file(&test, &id)).unwrap();
+        assert!(
+            file.contains(&format!("- type: relates-to\n  to: {shadow}\n")),
+            "{file}"
+        );
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn fields_the_server_fills_in_are_rejected_when_an_agent_sends_them() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (id, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let mut create = prisma_caveat("Prisma needs a shadow database");
+    create["id"] = json!("01JB3K8V9Q0000000000000000");
+    create["created"] = json!("2026-10-23T10:00:00Z");
+    create["state"] = json!("active");
+    create["mood"] = json!("calm");
+
+    let (is_error, text) = call(
+        &client,
+        "write",
+        json!({ "operations": [
+            create,
+            {
+                "op": "update",
+                "id": id,
+                "version": version,
+                "branch": "feature/x",
+                "updated": "2026-10-23T10:00:00Z",
+                "supersedes": [],
+            },
+        ] }),
+    )
+    .await;
+
+    assert!(is_error, "{text}");
+    insta::assert_snapshot!(text);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_body_over_8000_characters_is_rejected_with_advice_to_split_it() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (id, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let body = |size: usize| {
+        let sections = "## Symptom\n\n## Cause\n\n## Avoidance\n\n";
+        format!("{sections}{}", "é".repeat(size - sections.chars().count()))
+    };
+    let mut at_cap = prisma_caveat("Exactly at the cap");
+    at_cap["body"] = json!(body(8_000));
+    let mut over = prisma_caveat("One character over the cap");
+    over["body"] = json!(body(8_001));
+
+    let (is_error, text) = call(
+        &client,
+        "write",
+        json!({ "operations": [
+            at_cap,
+            over,
+            { "op": "update", "id": id, "version": version, "body": body(9_000) },
+        ] }),
+    )
+    .await;
+
+    assert!(is_error, "{text}");
+    insta::assert_snapshot!(text);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn every_problem_in_a_batch_of_mixed_operations_is_reported_at_once() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (id, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+
+    let (is_error, text) = call(
+        &client,
+        "write",
+        json!({ "operations": [
+            { "op": "update", "id": id, "version": "0000000000000000", "summary": "" },
+            { "op": "update", "id": id, "version": version, "kind": "decision" },
+            { "op": "delete", "id": "01JB3K8V9Q0000000000000000", "version": version },
+            { "op": "delete", "id": "dep:npm:prisma", "version": version },
+            {
+                "op": "link", "from": id, "type": "relates-to", "to": "ref:later",
+                "from_version": version,
+            },
+            {
+                "op": "link", "from": id, "type": "relates-to", "to": id,
+                "from_version": version,
+            },
+            {
+                "op": "link", "from": id, "type": "about", "to": "dep:npm:prisma",
+                "from_version": version, "version": "5.14.0",
+            },
+            {
+                "op": "link", "from": "dep:npm:prisma", "type": "depends-on",
+                "to": "dep:npm:prisma", "from_version": version,
+            },
+            {
+                "op": "unlink", "from": id, "type": "about", "to": "dep:npm:prisma",
+                "from_version": version,
+            },
+            {
+                "op": "unlink", "from": id, "type": "relates-to", "to": "dep:npm:prisma",
+                "from_version": version,
+            },
+            {
+                "op": "supersede", "id": id, "version": version,
+                "replacement": {
+                    "kind": "how-to", "title": "Set up a shadow database",
+                    "summary": "Point SHADOW_DATABASE_URL at an empty database.",
+                    "body": "## Steps\n\n1. Create it.\n",
+                    "links": [
+                        { "type": "about", "to": "dep:npm:prisma" },
+                        { "type": "relates-to", "to": id },
+                    ],
+                    "ref": "later",
+                },
+            },
+            prisma_caveat("Fine on its own"),
+        ] }),
+    )
+    .await;
+
+    assert!(is_error, "{text}");
+    redacted().bind(|| insta::assert_snapshot!(text));
+    assert_eq!(
+        fs::read_dir(test.default_brain().join("recollections"))
+            .unwrap()
+            .count(),
+        1
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_batch_cannot_delete_a_recollection_it_links_to_or_change_one_by_ref() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (old, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let mut linking = prisma_caveat("Prisma needs a shadow database");
+    linking["ref"] = json!("new");
+    linking["links"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "type": "relates-to", "to": old }));
+
+    let (is_error, text) = call(
+        &client,
+        "write",
+        json!({ "operations": [
+            linking,
+            { "op": "delete", "id": old, "version": version },
+            { "op": "update", "id": "ref:new", "version": version, "title": "Renamed" },
+        ] }),
+    )
+    .await;
+
+    assert!(is_error, "{text}");
+    redacted().bind(|| insta::assert_snapshot!(text));
     client.cancel().await.unwrap();
 }

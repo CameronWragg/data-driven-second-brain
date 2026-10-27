@@ -1,0 +1,7 @@
+---
+source: tests/serve.rs
+assertion_line: 399
+expression: text
+---
+0. superseded [ULID] with caveat [ULID] "Prisma 5 warns when the shadow database is missing" (version [VERSION])
+Commit: [SHA]

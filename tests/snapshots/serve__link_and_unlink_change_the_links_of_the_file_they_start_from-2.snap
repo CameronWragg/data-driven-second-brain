@@ -1,0 +1,10 @@
+---
+source: tests/serve.rs
+assertion_line: 484
+expression: message
+---
+Unlink caveat: Prisma migrations fail silently
+
+Recollection: [ULID]
+Action: unlink
+Author: agent

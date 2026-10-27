@@ -1,0 +1,10 @@
+---
+source: tests/serve.rs
+assertion_line: 371
+expression: message
+---
+Update caveat: Prisma migrate dev needs a shadow database
+
+Recollection: [ULID]
+Action: update
+Author: agent

@@ -1,0 +1,8 @@
+---
+source: tests/serve.rs
+assertion_line: 517
+expression: text
+---
+rejected: the batch failed its checks, so nothing was written
+- operation 0 (concurrency): conflict: [ULID] has changed since version [VERSION]; its current version is [VERSION]
+`get` each changed Recollection again, redo your change on its current text, fix every other problem above and send the whole batch again.

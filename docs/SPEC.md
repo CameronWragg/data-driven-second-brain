@@ -620,7 +620,7 @@ Integration tests drive the real binary over MCP stdio using rmcp's client.
 - **Shutdown:** after `SIGINT`, `SIGTERM`, `SIGHUP` or stdin EOF, `serve` exits within 100 ms, even with a push hanging on an unreachable remote.
 - **Scanner:** `tests/fixtures/checkouts/<case>/` holds real manifest and lockfile sets for every row of §7.2, plus a workspace, a git dependency, a path dependency and a version that can't be parsed. They are copied into a temp Checkout and `git init`ed.
 - **Format upgrades:** `tests/fixtures/brains/v<N>/` holds a small, realistic brain frozen at every format version that has shipped, starting with `v1` when M1 lands; each format bump adds the previous version's fixture. A test copies each one, runs `serve`, and checks the migrated files (snapshots), the single `migrate` commit, and that a second start changes nothing. Another writes `format = <current + 1>` and asserts every tool returns `incompatible`.
-- **Output:** tool output is checked with `insta` snapshots, with ULIDs, hashes and timestamps redacted. Error codes, files on disk and git history get plain assertions.
+- **Output:** tool output, and the commit messages and files a `write` generates, are checked with `insta` snapshots, with ULIDs, hashes and timestamps redacted. Error codes, which files a commit touches, commit counts and anything redaction would hide, such as the ID a Link points at, get plain assertions.
 
 ### 16.4 Real model and eval
 
@@ -628,7 +628,7 @@ A separate opt-in group of tests (`just test-model`) uses the real model. It che
 
 ### 16.5 CI
 
-Every PR runs natively on Linux and macOS: `cargo fmt --check`, clippy with `-D warnings`, `cargo deny`, nextest's default profile (unit tests, integration tests and snapshots, all on the `hash` provider), and the real-model group, with the weights cached by pinned revision and hash. The eval gate runs on Linux only. There is no scheduled CI and no coverage threshold.
+Every PR runs natively on Linux and macOS: `cargo fmt --check`, clippy with `-D warnings`, nextest's default profile (unit tests, integration tests and snapshots, all on the `hash` provider), and the real-model group, with the weights cached by pinned revision and hash. `cargo deny` and the eval gate run on Linux only; advisories and licences don't differ by platform. There is no scheduled CI and no coverage threshold.
 
 ## 17. Configuration and format versioning
 
