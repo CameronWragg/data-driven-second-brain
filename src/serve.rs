@@ -31,9 +31,10 @@ const INSTRUCTIONS: &str = include_str!("instructions.txt");
 /// About how many characters a `get` result may hold (SPEC §14.4).
 const GET_BUDGET: usize = 30_000;
 
-/// How many results `search` gives when the Agent doesn't say, and the most
-/// it gives (SPEC §14.4).
+/// How many results `search` gives when the Agent doesn't say (SPEC §14.4).
 const SEARCH_LIMIT: u32 = 10;
+
+/// The most results `search` gives, whatever the Agent asks for.
 const SEARCH_MAX: u32 = 25;
 
 /// How long a tool call waits for the startup sequence when
@@ -50,13 +51,16 @@ pub fn run() -> anyhow::Result<()> {
     let brain = Arc::new(Brain::open(&config.brain_path)?);
     let lock_timeout = config.lock_timeout.unwrap_or(lock::DEFAULT_TIMEOUT);
     let (started, startup) = watch::channel(false);
-    let indexed = Arc::new(AtomicBool::new(false));
-    let server = Server {
+    let indexing = Indexing {
         brain: brain.clone(),
         lock_timeout,
+        current: Arc::new(AtomicBool::new(false)),
+    };
+    let server = Server {
+        brain,
         startup,
         startup_timeout: config.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
-        indexed: indexed.clone(),
+        indexing: indexing.clone(),
         tool_router: Server::tool_router(),
     };
     tokio::runtime::Builder::new_multi_thread()
@@ -67,7 +71,7 @@ pub fn run() -> anyhow::Result<()> {
             tokio::task::spawn_blocking(move || {
                 // A failure is reported by the first tool that needs the index,
                 // which tries again.
-                let _ = refresh_index(&brain, lock_timeout, &indexed);
+                let _ = indexing.current();
                 let _ = started.send(true);
             });
             let service = server.serve(rmcp::transport::stdio()).await?;
@@ -76,40 +80,57 @@ pub fn run() -> anyhow::Result<()> {
         })
 }
 
-/// Brings the index up to date with the files under the write lock, unless
-/// `indexed` says this `serve` already has: the startup sequence's step that
-/// is built so far (SPEC §2 step 3.4), retried by the tools that need it.
-fn refresh_index(
-    brain: &Brain,
+/// Keeps the index up to date with the files for this `serve`: the step of
+/// the startup sequence built so far (SPEC §2 step 3.4), retried by the tools
+/// that need it until it succeeds.
+#[derive(Debug, Clone)]
+struct Indexing {
+    brain: Arc<Brain>,
     lock_timeout: Duration,
-    indexed: &AtomicBool,
-) -> Result<(), ToolError> {
-    if indexed.load(Ordering::Acquire) {
-        return Ok(());
+    /// Whether this `serve` has brought the index up to date, and nothing has
+    /// left it behind since.
+    current: Arc<AtomicBool>,
+}
+
+impl Indexing {
+    /// Opens the index, first bringing it up to date under the write lock
+    /// unless this `serve` already has.
+    fn current(&self) -> Result<Index, ToolError> {
+        let mut index = Index::open(&self.brain).map_err(ToolError::internal)?;
+        if !self.current.load(Ordering::Acquire) {
+            self.refresh(&mut index)?;
+            self.current.store(true, Ordering::Release);
+        }
+        Ok(index)
     }
-    let lock = WriteLock::take(brain.root(), lock_timeout).map_err(|error| match error {
-        timeout @ LockError::Timeout(_) => ToolError {
-            code: "busy",
-            message: format!("the index couldn't be brought up to date: {timeout}"),
-            next: "Nothing was changed; call again in a moment.".into(),
-        },
-        error => ToolError::internal(error),
-    })?;
-    let mut index = Index::open(brain).map_err(ToolError::internal)?;
-    index.refresh(brain, &lock).map_err(ToolError::internal)?;
-    indexed.store(true, Ordering::Release);
-    Ok(())
+
+    fn refresh(&self, index: &mut Index) -> Result<(), ToolError> {
+        let (brain, lock_timeout) = (&self.brain, self.lock_timeout);
+        let lock = WriteLock::take(brain.root(), lock_timeout).map_err(|error| match error {
+            timeout @ LockError::Timeout(_) => ToolError {
+                code: "busy",
+                message: format!("the index couldn't be brought up to date: {timeout}"),
+                next: "Nothing was changed; call again in a moment.".into(),
+            },
+            error => ToolError::internal(error),
+        })?;
+        index.refresh(brain, &lock).map_err(ToolError::internal)?;
+        Ok(())
+    }
+
+    /// Records that the index missed a change, so the next call refreshes it.
+    fn fell_behind(&self) {
+        self.current.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Server {
     brain: Arc<Brain>,
-    lock_timeout: Duration,
     /// Whether the startup sequence has finished.
     startup: watch::Receiver<bool>,
     startup_timeout: Duration,
-    /// Whether the index has been brought up to date with the files.
-    indexed: Arc<AtomicBool>,
+    indexing: Indexing,
     tool_router: ToolRouter<Server>,
 }
 
@@ -246,11 +267,6 @@ impl Server {
             }),
         }
     }
-
-    /// What a blocking call needs to bring the index up to date.
-    fn index_needs(&self) -> (Arc<Brain>, Duration, Arc<AtomicBool>) {
-        (self.brain.clone(), self.lock_timeout, self.indexed.clone())
-    }
 }
 
 #[tool_router]
@@ -270,9 +286,9 @@ impl Server {
         if let Err(error) = self.started().await {
             return error.result();
         }
-        let (brain, lock_timeout, indexed) = self.index_needs();
+        let indexing = self.indexing.clone();
         blocking(move || {
-            refresh_index(&brain, lock_timeout, &indexed)?;
+            let index = indexing.current()?;
             let query = Query {
                 text: params.query,
                 kinds: params.kinds.unwrap_or_default(),
@@ -281,7 +297,6 @@ impl Server {
                 include_abandoned: params.include_abandoned.unwrap_or(false),
                 limit: params.limit.unwrap_or(SEARCH_LIMIT).clamp(1, SEARCH_MAX) as usize,
             };
-            let index = Index::open(&brain).map_err(ToolError::internal)?;
             let hits = index.search(&query).map_err(ToolError::internal)?;
             Ok(render_search(&hits))
         })
@@ -292,7 +307,8 @@ impl Server {
     /// front-matter, `version` and body of each.
     #[tool(annotations(read_only_hint = true))]
     async fn get(&self, Parameters(params): Parameters<GetParams>) -> CallToolResult {
-        // `get` reads files, not the index, so it works whatever startup did.
+        // Every call waits for startup (SPEC §2), but `get` reads files, not
+        // the index, so it carries on whatever startup did.
         let _ = self.started().await;
         let brain = self.brain.clone();
         blocking(move || {
@@ -315,13 +331,18 @@ impl Server {
         if let Err(error) = self.started().await {
             return error.result();
         }
-        let (brain, lock_timeout, indexed) = self.index_needs();
+        let indexing = self.indexing.clone();
         blocking(move || {
-            refresh_index(&brain, lock_timeout, &indexed)?;
-            let mut index = Index::open(&brain).map_err(ToolError::internal)?;
-            let now = SystemTime::now();
-            match write::write(&brain, &mut index, params.operations, lock_timeout, now) {
-                Ok(written) => Ok(render_written(&written)),
+            let mut index = indexing.current()?;
+            let (brain, lock_timeout, now) =
+                (&indexing.brain, indexing.lock_timeout, SystemTime::now());
+            match write::write(brain, &mut index, params.operations, lock_timeout, now) {
+                Ok(written) => {
+                    if !written.indexed {
+                        indexing.fell_behind();
+                    }
+                    Ok(render_written(&written))
+                }
                 Err(error) => Err(write_error(error)),
             }
         })

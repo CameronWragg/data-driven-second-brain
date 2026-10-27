@@ -18,6 +18,7 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Every Kind there is.
     pub const ALL: [Kind; 5] = [
         Kind::Decision,
         Kind::Convention,
@@ -82,6 +83,15 @@ pub struct Link {
 pub enum State {
     Active,
     Abandoned,
+}
+
+impl State {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::Active => "active",
+            State::Abandoned => "abandoned",
+        }
+    }
 }
 
 /// A Recollection's front-matter, in the order its keys are written.

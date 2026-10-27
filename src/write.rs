@@ -219,6 +219,9 @@ pub struct Written {
     pub versions: BTreeMap<Ulid, String>,
     /// The commit's SHA.
     pub commit: String,
+    /// Whether the index took the batch too. If not, the files are still
+    /// written and committed, and the index must be refreshed from them.
+    pub indexed: bool,
 }
 
 /// What one operation did, to the Recollection it names: for a supersede,
@@ -312,7 +315,7 @@ pub fn write(
             });
         }
     }
-    let commit = commit(
+    let (commit, indexed) = commit(
         brain.root(),
         index,
         &lock,
@@ -323,6 +326,7 @@ pub fn write(
         outcomes: batch.outcomes,
         versions,
         commit,
+        indexed,
     })
 }
 
@@ -945,21 +949,25 @@ struct FileChange {
     after: Option<String>,
 }
 
+impl FileChange {
+    fn path_str(&self) -> &str {
+        self.path.to_str().expect("brain paths are UTF-8")
+    }
+}
+
 /// Applies `changes`, to the files and then the index, and commits exactly
-/// them. If the commit fails, the files and index are put back as they were
-/// so nothing is left half-written.
+/// them, returning the commit's SHA and whether the index took them. If the
+/// commit fails, the files and index are put back as they were so nothing is
+/// left half-written.
 fn commit(
     root: &Path,
     index: &mut Index,
     lock: &WriteLock,
     changes: &[FileChange],
     message: &str,
-) -> Result<String, WriteError> {
-    let paths: Vec<&str> = changes
-        .iter()
-        .map(|change| change.path.to_str().expect("brain paths are UTF-8"))
-        .collect();
-    let result = apply(root, index, lock, changes, &paths, message);
+) -> Result<(String, bool), WriteError> {
+    let paths: Vec<&str> = changes.iter().map(FileChange::path_str).collect();
+    let result = apply(root, index, lock, changes, message);
     if result.is_err() {
         for change in changes {
             let _ = put(root, &change.path, change.before.as_deref());
@@ -968,20 +976,19 @@ fn commit(
         reset.extend(paths);
         let _ = git::run(root, &reset);
     }
-    // The batch has landed, so a failure from here on must not undo it. An
-    // index left behind is caught up at the next startup, by the hashes.
-    let _ = result?.commit();
-    Ok(git::run(root, &["rev-parse", "HEAD"])?.trim().to_owned())
+    // The batch has landed, so a failure from here on must not undo it; an
+    // index left behind is caught up from the files' hashes.
+    let indexed = result?.commit().is_ok();
+    let sha = git::run(root, &["rev-parse", "HEAD"])?.trim().to_owned();
+    Ok((sha, indexed))
 }
 
-/// The part of `commit` that `commit` undoes if it fails: `paths` are the
-/// paths of `changes`.
+/// The part of `commit` that `commit` undoes if it fails.
 fn apply<'a>(
     root: &Path,
     index: &'a mut Index,
     lock: &WriteLock,
     changes: &[FileChange],
-    paths: &[&str],
     message: &str,
 ) -> Result<Staged<'a>, WriteError> {
     for change in changes {
@@ -989,19 +996,19 @@ fn apply<'a>(
     }
     let staged = index.stage(
         lock,
-        paths
+        changes
             .iter()
-            .zip(changes)
-            .map(|(path, change)| (*path, change.after.as_deref())),
+            .map(|change| (change.path_str(), change.after.as_deref())),
     )?;
+    let paths: Vec<&str> = changes.iter().map(FileChange::path_str).collect();
     // `add` stages a deleted path's removal too.
     let mut add = vec!["add", "--"];
-    add.extend(paths);
+    add.extend(&paths);
     git::run(root, &add)?;
     // Naming the paths commits only them, never a hand edit that happens to be
     // staged.
     let mut commit = vec!["commit", "--quiet", "--message", message, "--"];
-    commit.extend(paths);
+    commit.extend(&paths);
     git::run(root, &commit)?;
     Ok(staged)
 }

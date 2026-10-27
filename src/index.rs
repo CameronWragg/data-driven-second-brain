@@ -19,6 +19,7 @@ use crate::recollection::{self, Kind, LinkType, Recollection, State};
 /// What a search asks for (SPEC §6.4, keyword part).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query {
+    /// The words to find; any of them matches.
     pub text: String,
     /// Only Recollections of these Kinds; any Kind if empty.
     pub kinds: Vec<Kind>,
@@ -26,7 +27,9 @@ pub struct Query {
     pub entities: Vec<String>,
     /// Only Recollections with one of these tags.
     pub tags: Vec<String>,
+    /// Whether `abandoned` Recollections are found too.
     pub include_abandoned: bool,
+    /// The most results to give.
     pub limit: usize,
 }
 
@@ -228,12 +231,14 @@ impl Index {
 pub struct Staged<'a>(Transaction<'a>);
 
 impl Staged<'_> {
+    /// Makes the changes visible to every connection.
     pub fn commit(self) -> Result<(), IndexError> {
         Ok(self.0.commit()?)
     }
 }
 
 impl ItemKind {
+    /// The kind as `search` results name it (SPEC §6.4).
     pub fn as_str(self) -> &'static str {
         match self {
             ItemKind::Recollection(kind) => kind.as_str(),
@@ -394,7 +399,7 @@ fn put(transaction: &Transaction, path: &str, text: Option<&str>) -> Result<(), 
         "INSERT INTO files (path, hash) VALUES (?1, ?2)",
         [path, &recollection::version(text)],
     )?;
-    let Some(entry) = Entry::read(&id, text) else {
+    let Some(indexed) = Indexed::read(&id, text) else {
         return Ok(());
     };
     transaction.execute(
@@ -403,43 +408,43 @@ fn put(transaction: &Transaction, path: &str, text: Option<&str>) -> Result<(), 
         params![
             id_text,
             path,
-            entry.kind.as_str(),
-            entry.title,
-            entry.summary,
-            entry.state,
-            entry.branch
+            indexed.kind.as_str(),
+            indexed.title,
+            indexed.summary,
+            indexed.state.as_str(),
+            indexed.branch
         ],
     )?;
     let row = transaction.last_insert_rowid();
-    for tag in &entry.tags {
+    for tag in &indexed.tags {
         transaction.execute(
             "INSERT INTO tags (id, tag) VALUES (?1, ?2)",
             [&id_text, tag],
         )?;
     }
-    for link in &entry.links {
+    for link in &indexed.links {
         transaction.execute(
             "INSERT INTO links (source, type, target) VALUES (?1, ?2, ?3)",
             [&id_text, link.link_type.as_str(), &link.to],
         )?;
     }
-    let split = identifiers::split(&format!("{}\n{}", entry.title, entry.text));
+    let split = identifiers::split(&format!("{}\n{}", indexed.title, indexed.text));
     transaction.execute(
         "INSERT INTO text (rowid, title, body, split) VALUES (?1, ?2, ?3, ?4)",
-        params![row, entry.title, entry.text, split],
+        params![row, indexed.title, indexed.text, split],
     )?;
     Ok(())
 }
 
 /// What the index holds about one Item, read from its file.
-struct Entry {
+struct Indexed {
     kind: ItemKind,
     title: String,
     summary: String,
-    state: &'static str,
+    state: State,
     branch: Option<String>,
     tags: Vec<String>,
-    links: Vec<EntityLink>,
+    links: Vec<IndexedLink>,
     /// Everything searched besides the title.
     text: String,
 }
@@ -451,20 +456,20 @@ struct Entry {
 struct EntityFrontMatter {
     name: String,
     #[serde(default)]
-    links: Vec<EntityLink>,
+    links: Vec<IndexedLink>,
 }
 
 /// A Link from either kind of Item, without the fields only some carry.
 #[derive(Debug, Deserialize)]
-struct EntityLink {
+struct IndexedLink {
     #[serde(rename = "type")]
     link_type: LinkType,
     to: String,
 }
 
-impl Entry {
+impl Indexed {
     /// Reads the file of Item `id`, or `None` if it doesn't parse.
-    fn read(id: &ItemId, text: &str) -> Option<Entry> {
+    fn read(id: &ItemId, text: &str) -> Option<Indexed> {
         match id {
             ItemId::Recollection(_) => {
                 let Recollection { front_matter, body } = Recollection::parse(text).ok()?;
@@ -474,20 +479,17 @@ impl Entry {
                     front_matter.tags.join(" "),
                     body
                 );
-                Some(Entry {
+                Some(Indexed {
                     kind: ItemKind::Recollection(front_matter.kind),
                     title: front_matter.title,
                     summary: front_matter.summary,
-                    state: match front_matter.state {
-                        State::Active => "active",
-                        State::Abandoned => "abandoned",
-                    },
+                    state: front_matter.state,
                     branch: front_matter.branch,
                     tags: front_matter.tags,
                     links: front_matter
                         .links
                         .into_iter()
-                        .map(|link| EntityLink {
+                        .map(|link| IndexedLink {
                             link_type: link.link_type,
                             to: link.to,
                         })
@@ -504,14 +506,14 @@ impl Entry {
                     summary = summary.chars().take(ENTITY_SUMMARY - 1).collect();
                     summary.push('…');
                 }
-                Some(Entry {
+                Some(Indexed {
                     kind: match entity {
                         EntityId::Repository { .. } => ItemKind::Repository,
                         EntityId::Dependency { .. } => ItemKind::Dependency,
                     },
                     title: front_matter.name,
                     summary,
-                    state: "active",
+                    state: State::Active,
                     branch: None,
                     tags: Vec::new(),
                     links: front_matter.links,
