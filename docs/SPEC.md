@@ -62,7 +62,7 @@ All network steps are best-effort and bounded by `sync.timeout` (§17.1): a fail
   .index/                                       # git-ignored: SQLite index and lock file
 ```
 
-By default the folder is at `$XDG_DATA_HOME/latens`; the owner can move it with `brain.path` (§17.1). Files are the source of truth, and `.index/` can be rebuilt from them at any time ([ADR-0001](./adr/0001-files-as-truth-sqlite-as-index.md)).
+By default the folder is at `$XDG_DATA_HOME/latens`; the owner can move it with `brain.path` (§17.1). Files are the source of truth, and `.index/` can be rebuilt from them at any time ([ADR-0001](./adr/0001-files-as-truth-sqlite-as-index.md)). Git doesn't track empty folders, so a cloned brain may lack any of them: whatever writes a file creates its folders, and the ones `init` makes are only a convenience.
 
 ## 4. Data model
 
@@ -230,7 +230,7 @@ Distinct: covers the v5 behaviour; 01HZX… covers v4
 Author: agent
 ```
 
-`Author` is `agent` for a `write` batch, `owner` for hand edits committed at startup (§10), and `server` for commits the binary makes on its own: scanner changes, deleting abandoned Recollections, and migrations (§17.3).
+`Author` is `agent` for a `write` batch, `owner` for hand edits committed at startup (§10), and `server` for commits the binary makes on its own: `init`'s first commit (§12), scanner changes, deleting abandoned Recollections, and migrations (§17.3).
 
 **The write journal.** A batch must commit whole even if `serve` is killed part-way. Under the lock, before touching any file, `serve` writes `.index/journal` holding the full new content of every file, the paths to delete and the commit message, and fsyncs it. It then writes the files, updates the index, commits, and deletes the journal. A journal found at startup (§2) is rolled forward: every file is rewritten from it and committed with its message. Replaying is idempotent, so the batch lands exactly as the Agent was told it did, with its own `Author` and trailers rather than as an owner hand edit.
 
@@ -422,9 +422,9 @@ Several `serve` processes can share one brain, on one machine. The brain folder 
 
 ## 12. `latens init`
 
-`latens init` creates a new Second Brain. `latens init --clone <url>` joins an existing one from another machine: it clones the brain repository into the brain folder (default `$XDG_DATA_HOME/latens`, or `--path`), writes `brain.path` if the path is not the default, and then does steps 4 to 6 below. The brain repository's `origin` is the URL it was cloned from.
+`latens init` creates a new Second Brain. `latens init --clone <url>` joins an existing one from another machine: it clones the brain repository into the brain folder (default `$XDG_DATA_HOME/latens`, or `--path`), points the configuration at it as in step 1, and then does steps 4 to 6 below. The brain repository's `origin` is the URL it was cloned from.
 
-1. Create the brain folder (default `$XDG_DATA_HOME/latens`, or `--path`) and its layout, with `.index/` git-ignored and `brain.toml` holding the current format. A debug build also writes `dev = true` (§17.2). If `--path` is not the default, write `brain.path` to the configuration file (§17.1); otherwise write no configuration file.
+1. Create the brain folder (default `$XDG_DATA_HOME/latens`, or `--path`) and its layout, with `.index/` git-ignored and `brain.toml` holding the current format. A debug build also writes `dev = true` (§17.2). If the configuration doesn't already point at the folder, point it there (§17.1): set `brain.path`, or remove it when the folder is at the default, so no key always means the default. With no configuration file and the default path, write none.
 2. Run `git init` and make the first commit.
 3. Unless `--no-remote` is given, create a **private** remote with `gh repo create --private` if `gh` is available; otherwise ask for a remote URL.
 4. Print a generic MCP server config (`command`, `args`, stdio transport) plus short examples for common clients.
