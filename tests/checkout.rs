@@ -20,7 +20,15 @@ const API: &str = "repo:github.com/Owner/api";
 async fn context(client: &RunningService<RoleClient, ()>, checkout: &Path) -> String {
     let (is_error, text) = call(client, "context", json!({})).await;
     assert!(!is_error, "{text}");
-    text.replace(&checkout.display().to_string(), "[CHECKOUT]")
+    redact(&text, checkout, "[CHECKOUT]")
+}
+
+/// `text` with `path` replaced by `label`, in its canonical form too, since
+/// macOS reaches the temp folder through `/private`.
+fn redact(text: &str, path: &Path, label: &str) -> String {
+    let canonical = path.canonicalize().unwrap().display().to_string();
+    text.replace(&canonical, label)
+        .replace(&path.display().to_string(), label)
 }
 
 /// The Repository a `context` result names.
@@ -118,8 +126,7 @@ async fn context_without_a_checkout_says_so_and_path_detects_one() {
     .await;
     let (_, after) = call(&client, "context", json!({})).await;
 
-    let home = test.home().display().to_string();
-    insta::assert_snapshot!(without.replace(&home, "[HOME]"));
+    insta::assert_snapshot!(redact(&without, &test.home(), "[HOME]"));
     assert!(!is_error, "{with}");
     assert_eq!(repository(&with), API);
     assert_eq!(repository(&after), API);
@@ -499,8 +506,7 @@ async fn an_unknown_default_branch_is_reported_then_learned_once_the_checkout_kn
     let written = write_ok(&client, json!([caveat("Shadow without a default", API)])).await;
     client.cancel().await.unwrap();
 
-    let home = test.home().display().to_string();
-    insta::assert_snapshot!(text.replace(&home, "[HOME]"));
+    insta::assert_snapshot!(redact(&text, &test.home(), "[HOME]"));
     let file = fs::read_to_string(brain.join(format!("recollections/{}.md", created_id(&written))))
         .unwrap();
     assert!(
