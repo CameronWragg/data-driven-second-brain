@@ -7,7 +7,9 @@ use crate::brain::Brain;
 use crate::id::ItemId;
 use crate::recollection;
 
-/// A file found by its ID, exactly as it is on disk.
+/// A Recollection or Entity found by its ID, exactly as it is on disk. An
+/// Entity's linked Recollections and resolved `docs` (SPEC §14.4) wait for
+/// the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub id: ItemId,

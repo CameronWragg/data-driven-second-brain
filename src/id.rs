@@ -28,6 +28,14 @@ impl ItemId {
         Ulid::from_string(id).ok().map(ItemId::Recollection)
     }
 
+    /// The name of its kind of thing, as a tag that delimits its stored text.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            ItemId::Recollection(_) => "recollection",
+            ItemId::Entity(_) => "entity",
+        }
+    }
+
     /// The item's file, relative to the brain folder (SPEC §3).
     pub fn file(&self) -> PathBuf {
         match self {

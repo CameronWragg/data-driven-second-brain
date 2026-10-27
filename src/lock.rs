@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How long a writer waits for the lock when `lock.timeout` isn't set.
@@ -22,10 +22,7 @@ pub enum LockError {
     #[error("another writer held the write lock for longer than {}", humantime::format_duration(*.0))]
     Timeout(Duration),
     #[error("couldn't open the write lock {}: {source}", path.display())]
-    Io {
-        path: std::path::PathBuf,
-        source: io::Error,
-    },
+    Io { path: PathBuf, source: io::Error },
 }
 
 impl WriteLock {

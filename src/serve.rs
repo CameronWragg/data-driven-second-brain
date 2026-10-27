@@ -16,7 +16,6 @@ use serde::Deserialize;
 use crate::brain::Brain;
 use crate::config::{Config, Dirs};
 use crate::get::{self, Found};
-use crate::id::ItemId;
 use crate::lock::{self, LockError};
 use crate::recollection::Kind;
 use crate::write::{self, Operation, WriteError, Written};
@@ -259,7 +258,8 @@ impl ServerHandler for Server {
 
 /// Wraps an item's stored text in its `untrusted` delimiters, so the text
 /// can't close them itself.
-fn delimited(tag: &str, id: &ItemId, version: &str, text: &str) -> String {
+fn delimited(item: &get::Item, text: &str) -> String {
+    let (tag, id, version) = (item.id.tag(), &item.id, &item.version);
     let close = format!("</{tag}");
     let text = text.trim_end().replace(&close, &format!("<\\/{tag}"));
     format!("<{tag} id=\"{id}\" version=\"{version}\" untrusted>\n{text}\n</{tag}>\n")
@@ -282,15 +282,11 @@ fn render_get(found: Found) -> Result<String, ToolError> {
     let mut text = format!("{UNTRUSTED_NOTE}\n");
     let mut omitted = Vec::new();
     for (index, item) in found.items.iter().enumerate() {
-        let tag = match item.id {
-            ItemId::Recollection(_) => "recollection",
-            ItemId::Entity(_) => "entity",
-        };
-        let rendered = delimited(tag, &item.id, &item.version, &item.text);
+        let rendered = delimited(item, &item.text);
         if !omitted.is_empty() || text.len() + rendered.len() > GET_BUDGET {
             if index == 0 {
                 text.push('\n');
-                text.push_str(&truncated(tag, item));
+                text.push_str(&truncated(item));
                 continue;
             }
             omitted.push(item.id.to_string());
@@ -312,7 +308,7 @@ fn render_get(found: Found) -> Result<String, ToolError> {
 }
 
 /// The first item, cut to fit the budget on its own.
-fn truncated(tag: &str, item: &get::Item) -> String {
+fn truncated(item: &get::Item) -> String {
     let room = GET_BUDGET.saturating_sub(UNTRUSTED_NOTE.len() + 200);
     let cut = item
         .text
@@ -326,7 +322,7 @@ fn truncated(tag: &str, item: &get::Item) -> String {
         &item.text[..cut],
         item.text[cut..].chars().count()
     );
-    delimited(tag, &item.id, &item.version, &marker)
+    delimited(item, &marker)
 }
 
 fn render_written(written: &Written) -> String {
@@ -364,12 +360,9 @@ fn write_error(error: WriteError) -> ToolError {
                 next: "Fix every problem above and send the whole batch again.".into(),
             }
         }
-        WriteError::Lock(LockError::Timeout(timeout)) => ToolError {
+        WriteError::Lock(timeout @ LockError::Timeout(_)) => ToolError {
             code: "busy",
-            message: format!(
-                "another writer held the brain's write lock for longer than {}",
-                humantime::format_duration(timeout)
-            ),
+            message: timeout.to_string(),
             next: "Nothing was written; send the batch again in a moment.".into(),
         },
         error => ToolError::internal(error),
