@@ -628,7 +628,7 @@ A separate opt-in group of tests (`just test-model`) uses the real model. It che
 
 ### 16.5 CI
 
-Every PR runs natively on Linux and macOS: `cargo fmt --check`, clippy with `-D warnings`, `cargo deny`, nextest's default profile (unit tests, integration tests and snapshots, all on the `hash` provider), and the real-model group, with the weights cached by pinned revision and hash. The eval gate runs on Linux only. There is no scheduled CI and no coverage threshold.
+Every PR runs natively on Linux and macOS: `cargo fmt --check`, clippy with `-D warnings`, nextest's default profile (unit tests, integration tests and snapshots, all on the `hash` provider), and the real-model group, with the weights cached by pinned revision and hash. `cargo deny` and the eval gate run on Linux only; advisories and licences don't differ by platform. There is no scheduled CI and no coverage threshold.
 
 ## 17. Configuration and format versioning
 
