@@ -26,7 +26,7 @@ pub struct Item {
 /// The newest active Recollections about an Entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct About {
-    /// At most 10.
+    /// At most `ABOUT_LIMIT`.
     pub recollections: Vec<Hit>,
     /// How many there are in all.
     pub total: usize,
@@ -65,7 +65,7 @@ pub fn get(brain: &Brain, index: Option<&Index>, ids: &[String]) -> Result<Found
             Ok(text) => {
                 let about = match (&id, index) {
                     (ItemId::Entity(entity), Some(index)) => index
-                        .about(&entity.to_string(), ABOUT_LIMIT)
+                        .about(entity, ABOUT_LIMIT)
                         .ok()
                         .map(|(recollections, total)| About {
                             recollections,

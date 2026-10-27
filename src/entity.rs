@@ -79,6 +79,7 @@ pub struct BranchState {
     pub promotion: Option<PromotionStatus>,
 }
 
+/// What happened to a Branch (SPEC §9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BranchStatus {
@@ -88,6 +89,7 @@ pub enum BranchStatus {
     Unknown,
 }
 
+/// Where a merged Branch's Promotion stands (SPEC §9.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PromotionStatus {
@@ -118,6 +120,7 @@ pub struct EntityLink {
     pub by: Option<LinkSource>,
 }
 
+/// What derived a Link other than an Agent (SPEC §4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LinkSource {
@@ -180,6 +183,7 @@ impl Entity {
         }
     }
 
+    /// What the Entity is called.
     pub fn name(&self) -> &str {
         match &self.fields {
             Fields::Repository(fields) => &fields.name,
@@ -187,6 +191,7 @@ impl Entity {
         }
     }
 
+    /// Renames the Entity.
     pub fn set_name(&mut self, name: String) {
         match &mut self.fields {
             Fields::Repository(fields) => fields.name = name,
@@ -194,6 +199,7 @@ impl Entity {
         }
     }
 
+    /// The Links the Entity's file holds.
     pub fn links(&self) -> &[EntityLink] {
         match &self.fields {
             Fields::Repository(fields) => &fields.links,

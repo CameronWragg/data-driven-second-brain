@@ -20,8 +20,9 @@ use crate::brain::Brain;
 use crate::checkout::{self, Checkout};
 use crate::config::{Config, Dirs};
 use crate::get::{self, Found};
+use crate::id::ItemKind;
 use crate::id::{EntityId, ItemId};
-use crate::index::{Branches, Hit, Index, ItemKind, Query};
+use crate::index::{Branches, Hit, Index, Query};
 use crate::lock::{self, LockError, WriteLock};
 use crate::recollection::{Kind, Link};
 use crate::write::{self, Change, Check, Operation, WriteError, Written};
@@ -45,6 +46,9 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// About how many characters a `context` result may hold (SPEC §14.4).
 const CONTEXT_BUDGET: usize = 4_000;
+
+/// What ends a `context` result cut to fit its budget.
+const CONTEXT_CUT: &str = "\n[truncated to stay within the size budget]\n";
 
 /// The note before any stored text (SPEC §14.2).
 const UNTRUSTED_NOTE: &str =
@@ -70,6 +74,7 @@ pub fn run() -> anyhow::Result<()> {
     let place = Arc::new(Mutex::new(Place::default()));
     let server = Server {
         brain,
+        start: start.clone(),
         place: place.clone(),
         startup,
         startup_timeout: config.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
@@ -85,7 +90,8 @@ pub fn run() -> anyhow::Result<()> {
                 // A failure is reported by the first tool that needs the index,
                 // which tries again.
                 let _ = indexing.current();
-                *lock_place(&place) = locate(&start, &indexing);
+                *lock_place(&place) =
+                    locate(&start, &indexing).unwrap_or_else(|why| Place::Outside { why });
                 let _ = started.send(true);
             });
             let service = server.serve(rmcp::transport::stdio()).await?;
@@ -140,75 +146,77 @@ impl Indexing {
 
 /// Where this `serve` works: the Checkout it detected, or why it has none.
 #[derive(Debug, Clone, Default)]
-struct Place {
-    checkout: Option<Checkout>,
-    /// Why no Checkout was detected, when none was.
-    why_none: Option<String>,
-    /// What went wrong detecting the Checkout or recording its Repository.
-    problem: Option<String>,
+enum Place {
+    /// Before the startup sequence has looked.
+    #[default]
+    Unknown,
+    /// In a Checkout, with what went wrong recording its Repository, if
+    /// anything did.
+    InCheckout {
+        checkout: Checkout,
+        problem: Option<String>,
+    },
+    /// In no Checkout, for the reason given.
+    Outside { why: String },
 }
 
 impl Place {
-    /// The Checkout, with the Branch it has checked out now.
-    fn checkout(&self) -> Option<Checkout> {
-        let mut checkout = self.checkout.clone()?;
+    /// The Checkout, if any, with the Branch it has checked out now.
+    fn checkout_now(&self) -> Option<Checkout> {
+        let Place::InCheckout { checkout, .. } = self else {
+            return None;
+        };
+        let mut checkout = checkout.clone();
         checkout.refresh_branch();
         Some(checkout)
     }
 }
 
+/// Locks `place`. A panic while it was held can't leave a `Place`
+/// half-written, so a poisoned lock is taken as it is.
 fn lock_place(place: &Mutex<Place>) -> std::sync::MutexGuard<'_, Place> {
-    // A panic while it was held can't leave a `Place` half-written.
     place
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Detects the Checkout `dir` is in and makes sure the brain has its
-/// Repository (SPEC §2 step 4).
-fn locate(dir: &Path, indexing: &Indexing) -> Place {
+/// Repository (SPEC §2 step 4); an error if `dir` can't be read.
+fn locate(dir: &Path, indexing: &Indexing) -> Result<Place, String> {
     let brain = &indexing.brain;
-    match checkout::detect(dir, brain.root()) {
-        Ok(Some(mut checkout)) => {
-            let settled = Index::open(brain)
-                .map_err(WriteError::from)
-                .and_then(|mut index| {
-                    checkout::settle(brain, &mut index, indexing.lock_timeout, &mut checkout)
-                });
-            let problem = match settled {
-                Ok(indexed) => {
-                    if !indexed {
-                        indexing.fell_behind();
-                    }
-                    None
-                }
-                Err(error) => Some(format!(
-                    "couldn't record the Repository {}: {error}",
-                    checkout.repository
-                )),
-            };
-            Place {
-                checkout: Some(checkout),
-                why_none: None,
-                problem,
+    let found = checkout::detect(dir, brain.root())
+        .map_err(|error| format!("{} couldn't be read: {error}", dir.display()))?;
+    let Some(mut checkout) = found else {
+        return Ok(Place::Outside {
+            why: format!("{} isn't inside a git Checkout", dir.display()),
+        });
+    };
+    let settled = Index::open(brain)
+        .map_err(WriteError::from)
+        .and_then(|mut index| {
+            checkout::settle(brain, &mut index, indexing.lock_timeout, &mut checkout)
+        });
+    let problem = match settled {
+        Ok(indexed) => {
+            if !indexed {
+                indexing.fell_behind();
             }
+            None
         }
-        Ok(None) => Place {
-            checkout: None,
-            why_none: Some(format!("{} isn't inside a git Checkout", dir.display())),
-            problem: None,
-        },
-        Err(error) => Place {
-            checkout: None,
-            why_none: Some(format!("{} couldn't be read", dir.display())),
-            problem: Some(error.to_string()),
-        },
-    }
+        Err(error) => Some(format!(
+            "couldn't record the Repository {}: {error}",
+            checkout.repository
+        )),
+    };
+    Ok(Place::InCheckout { checkout, problem })
 }
 
 #[derive(Debug, Clone)]
 struct Server {
     brain: Arc<Brain>,
+    /// The folder `serve` was started for, which a relative `context` path
+    /// starts from.
+    start: PathBuf,
     place: Arc<Mutex<Place>>,
     /// Whether the startup sequence has finished.
     startup: watch::Receiver<bool>,
@@ -303,16 +311,20 @@ struct SearchParams {
     limit: Option<u32>,
 }
 
+/// The Branches `search` covers besides the current and default ones.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum BranchesParam {
-    Every(Every),
+    /// `"all"`: every Branch.
+    Every(AllBranches),
+    /// Branch names: of the Repository in scope, or of any with `scope: all`.
     Names(Vec<String>),
 }
 
+/// The word that asks for every Branch.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
-enum Every {
+enum AllBranches {
     All,
 }
 
@@ -375,14 +387,21 @@ impl Server {
             return error.result();
         }
         let (place, indexing) = (self.place.clone(), self.indexing.clone());
+        let start = self.start.clone();
         blocking(move || {
+            // A `path` that can't be read keeps the Checkout found before.
+            let mut unreadable = None;
             if let Some(path) = params.path {
-                let dir = std::path::absolute(&path).unwrap_or_else(|_| PathBuf::from(&path));
-                *lock_place(&place) = locate(&dir, &indexing);
+                match locate(&start.join(path), &indexing) {
+                    Ok(found) => *lock_place(&place) = found,
+                    Err(why) => unreadable = Some(why),
+                }
             }
             let mut place = lock_place(&place).clone();
-            place.checkout = place.checkout();
-            Ok(render_context(&place))
+            if let Place::InCheckout { checkout, .. } = &mut place {
+                checkout.refresh_branch();
+            }
+            Ok(render_context(&indexing.brain, &place, unreadable))
         })
         .await
     }
@@ -396,10 +415,10 @@ impl Server {
         }
         let (indexing, place) = (self.indexing.clone(), self.place.clone());
         blocking(move || {
-            let checkout = lock_place(&place).checkout();
+            let checkout = lock_place(&place).checkout_now();
             let current = checkout
                 .as_ref()
-                .map(|checkout| checkout.repository.to_string());
+                .map(|checkout| checkout.repository.clone());
             let repository = match params.scope.as_deref() {
                 None | Some("current") => current,
                 Some("all") => None,
@@ -407,7 +426,7 @@ impl Server {
                     Some(id @ EntityId::Repository { .. })
                         if indexing.brain.root().join(id.file()).is_file() =>
                     {
-                        Some(id.to_string())
+                        Some(id)
                     }
                     _ => {
                         return Err(ToolError {
@@ -420,17 +439,29 @@ impl Server {
                     }
                 },
             };
-            let here = checkout
-                .as_ref()
-                .and_then(Checkout::recorded_branch)
-                .map(str::to_owned);
+            let here = checkout.as_ref().and_then(Checkout::branch_id);
             let branches = match params.branches {
-                Some(BranchesParam::Every(Every::All)) => Branches::All,
-                Some(BranchesParam::Names(mut names)) => {
-                    names.extend(here);
-                    Branches::Only(names)
-                }
-                None => Branches::Only(here.into_iter().collect()),
+                Some(BranchesParam::Every(AllBranches::All)) => Branches::All,
+                // Names are the Branches of the Repository in scope, or of any
+                // Repository when every one is in scope.
+                Some(BranchesParam::Names(names)) => match &repository {
+                    Some(repository) => Branches::Only {
+                        ids: names
+                            .iter()
+                            .map(|name| repository.branch(name))
+                            .chain(here)
+                            .collect(),
+                        names: Vec::new(),
+                    },
+                    None => Branches::Only {
+                        ids: here.into_iter().collect(),
+                        names,
+                    },
+                },
+                None => Branches::Only {
+                    ids: here.into_iter().collect(),
+                    names: Vec::new(),
+                },
             };
             let header = if checkout.is_none()
                 && matches!(params.scope.as_deref(), None | Some("current"))
@@ -439,7 +470,7 @@ impl Server {
                  Repository."
                     .to_owned()
             } else {
-                searched(repository.as_deref(), &branches)
+                searched(repository.as_ref(), &branches)
             };
             let index = indexing.current()?;
             let query = Query {
@@ -492,7 +523,7 @@ impl Server {
         }
         let (indexing, place) = (self.indexing.clone(), self.place.clone());
         blocking(move || {
-            let checkout = lock_place(&place).checkout();
+            let checkout = lock_place(&place).checkout_now();
             let mut index = indexing.current()?;
             let (brain, lock_timeout, now) =
                 (&indexing.brain, indexing.lock_timeout, SystemTime::now());
@@ -569,15 +600,23 @@ fn unclosing(tag: &str, text: &str) -> String {
 }
 
 /// What a search covered, as its first line says it.
-fn searched(repository: Option<&str>, branches: &Branches) -> String {
+fn searched(repository: Option<&EntityId>, branches: &Branches) -> String {
     let repositories = match repository {
         Some(repository) => format!("{repository} and the Entities it Links to"),
         None => "every Repository".to_owned(),
     };
     let branches = match branches {
         Branches::All => "every Branch".to_owned(),
-        Branches::Only(names) if names.is_empty() => "the default branch".to_owned(),
-        Branches::Only(names) => format!("the default branch and {}", names.join(", ")),
+        Branches::Only { ids, names } if ids.is_empty() && names.is_empty() => {
+            "the default branch".to_owned()
+        }
+        Branches::Only { ids, names } => {
+            let names = names
+                .iter()
+                .map(|name| format!("every Repository's {name}"));
+            let others: Vec<String> = ids.iter().cloned().chain(names).collect();
+            format!("the default branch and {}", others.join(", "))
+        }
     };
     format!("Searched {repositories}, on {branches}.")
 }
@@ -618,38 +657,64 @@ fn hit_line(hit: &Hit) -> String {
 }
 
 /// Renders where this `serve` works, then a to-do line, within the budget.
-fn render_context(place: &Place) -> String {
+/// `unreadable` says why a `path` just given couldn't be read.
+fn render_context(brain: &Brain, place: &Place, unreadable: Option<String>) -> String {
     let mut text = String::new();
     let mut to_do = Vec::new();
-    match &place.checkout {
-        Some(checkout) => {
-            let default = &checkout.default_branch;
+    match place {
+        Place::InCheckout { checkout, problem } => {
             text.push_str(&format!("Repository: {}\n", checkout.repository));
-            text.push_str(&match &checkout.branch {
-                Some(branch) if branch == default => {
-                    format!("Branch: {branch} (the default branch)\n")
+            match (&checkout.branch, &checkout.default_branch) {
+                (Some(branch), Some(default)) if branch == default => {
+                    text.push_str(&format!("Branch: {branch} (the default branch)\n"));
                 }
-                Some(branch) => format!("Branch: {branch} (default branch: {default})\n"),
-                None => format!(
-                    "Branch: none, since HEAD is detached; writes go to the default branch, \
-                     {default}\n"
-                ),
-            });
+                (Some(branch), Some(default)) => {
+                    text.push_str(&format!("Branch: {branch} (default branch: {default})\n"));
+                }
+                (Some(branch), None) => text.push_str(&format!(
+                    "Branch: {branch}; the default branch is unknown, so Recollections written \
+                     here belong to {branch}\n"
+                )),
+                (None, _) => {
+                    text.push_str(
+                        "Branch: none, since HEAD is detached; `write` can't create \
+                         Recollections until a Branch is checked out\n",
+                    );
+                    to_do.push("check out a Branch before creating Recollections".to_owned());
+                }
+            }
             text.push_str(&format!("Checkout: {}\n", checkout.path.display()));
+            if let Some(remote) = &checkout.unhosted_remote {
+                text.push_str(&format!(
+                    "Its origin, {remote}, isn't a hosted remote, so the Repository has a local ID.\n"
+                ));
+            }
+            if checkout.default_branch.is_none() {
+                let file = brain.root().join(checkout.repository.file());
+                to_do.push(format!(
+                    "ask the owner to set `default_branch` in {}",
+                    file.display()
+                ));
+            }
+            if let Some(problem) = problem {
+                text.push_str(&format!("Problem: {problem}\n"));
+                to_do.push("tell the owner about the problem above".to_owned());
+            }
         }
-        None => {
-            let why = place.why_none.as_deref().unwrap_or("none was found");
+        Place::Outside { why } => {
             text.push_str(&format!(
                 "No Checkout is detected: {why}. `search` covers every Repository.\n"
             ));
             to_do.push(
-                "if you are working in a Repository, call `context` with `path` set to its folder",
+                "if you are working in a Repository, call `context` with `path` set to its folder"
+                    .to_owned(),
             );
         }
+        Place::Unknown => text.push_str("The startup sequence hasn't looked for a Checkout.\n"),
     }
-    if let Some(problem) = &place.problem {
-        text.push_str(&format!("Problem: {problem}\n"));
-        to_do.push("tell the owner about the problem above");
+    if let Some(why) = unreadable {
+        text.push_str(&format!("Problem: {why}; nothing above changed.\n"));
+        to_do.push("call `context` again with a folder inside the Checkout".to_owned());
     }
     let to_do = match to_do.as_slice() {
         [] => "nothing".to_owned(),
@@ -657,8 +722,11 @@ fn render_context(place: &Place) -> String {
     };
     text.push_str(&format!("To do: {to_do}.\n"));
     if text.chars().count() > CONTEXT_BUDGET {
-        text = text.chars().take(CONTEXT_BUDGET - 20).collect();
-        text.push_str("\n[truncated]\n");
+        text = text
+            .chars()
+            .take(CONTEXT_BUDGET - CONTEXT_CUT.chars().count())
+            .collect();
+        text.push_str(CONTEXT_CUT);
     }
     text
 }

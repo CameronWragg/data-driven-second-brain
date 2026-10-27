@@ -1,7 +1,8 @@
 //! Checkouts (SPEC §4.3): the local copy of a Repository an Agent works in,
 //! and the Repository and Branch it gives.
 
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,22 +11,29 @@ use ulid::Ulid;
 use crate::brain::Brain;
 use crate::entity::{Entity, Fields};
 use crate::git::{self, GitError};
-use crate::id::{EntityId, ItemId};
+use crate::id::EntityId;
 use crate::index::Index;
 use crate::lock::WriteLock;
-use crate::write::{self, FileChange, WriteError};
+use crate::write::{self, Change, WriteError};
 
 /// A Checkout found on this machine, and what it gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkout {
     /// The Checkout's top-level folder.
     pub path: PathBuf,
+    /// The Repository it is a copy of.
     pub repository: EntityId,
     /// What the Repository is called when the brain first records it.
     pub name: String,
-    /// The Branch checked out, or `None` on a detached HEAD.
+    /// The Branch checked out, or being rebased; `None` if HEAD is detached
+    /// with no rebase to name one.
     pub branch: Option<String>,
-    pub default_branch: String,
+    /// The Repository's default branch; `None` if nothing in the Checkout or
+    /// the brain says which it is.
+    pub default_branch: Option<String>,
+    /// An `origin` that isn't a hosted remote, which is why the Repository
+    /// has a local ID.
+    pub unhosted_remote: Option<String>,
 }
 
 /// Why a folder's Checkout couldn't be detected.
@@ -59,10 +67,11 @@ pub fn detect(dir: &Path, brain_root: &Path) -> Result<Option<Checkout>, DetectE
     if canonical(&path).starts_with(canonical(brain_root)) {
         return Ok(None);
     }
-    let remote = git::run(&path, &["config", "--get", "remote.origin.url"]).ok();
-    let (repository, name) = match remote
-        .as_deref()
-        .and_then(|url| repository_of_remote(url.trim()))
+    // `get-url`, unlike reading the config, applies `insteadOf` rewrites.
+    let remote = git::run(&path, &["remote", "get-url", "origin"])
+        .ok()
+        .map(|url| url.trim().to_owned());
+    let (repository, name, unhosted_remote) = match remote.as_deref().and_then(repository_of_remote)
     {
         Some(repository) => {
             let name = repository
@@ -71,24 +80,25 @@ pub fn detect(dir: &Path, brain_root: &Path) -> Result<Option<Checkout>, DetectE
                 .next()
                 .unwrap_or_default()
                 .to_owned();
-            (repository, name)
+            (repository, name, None)
         }
         None => {
             let name = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            (local_repository(&path)?, name)
+            (local_repository(&path)?, name, remote)
         }
     };
     let branch = current_branch(&path);
-    let default_branch = default_branch(&path, branch.as_deref());
+    let default_branch = default_branch(&path);
     Ok(Some(Checkout {
         path,
         repository,
         name,
         branch,
         default_branch,
+        unhosted_remote,
     }))
 }
 
@@ -102,32 +112,39 @@ fn local_repository(path: &Path) -> Result<EntityId, DetectError> {
         path: file.clone(),
         source,
     };
-    let ulid = match std::fs::read_to_string(&file) {
-        Ok(text) => {
-            Ulid::from_string(text.trim()).map_err(|_| DetectError::BadLocalId(file.clone()))?
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let ulid = Ulid::generate();
-            std::fs::write(&file, format!("{ulid}\n")).map_err(io)?;
-            ulid
-        }
+    // Made only if missing, so two `serve`s starting together agree on one ID.
+    match OpenOptions::new().write(true).create_new(true).open(&file) {
+        Ok(mut created) => created
+            .write_all(format!("{}\n", Ulid::generate()).as_bytes())
+            .map_err(io)?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(source) => return Err(io(source)),
-    };
+    }
+    let text = std::fs::read_to_string(&file).map_err(io)?;
+    let ulid = Ulid::from_string(text.trim()).map_err(|_| DetectError::BadLocalId(file.clone()))?;
     Ok(EntityId::Repository {
         path: format!("local/{ulid}"),
     })
 }
 
-/// The Branch checked out at `path`, or `None` on a detached HEAD.
+/// The Branch checked out at `path`, or the one a rebase in progress is
+/// rebasing, since a rebase detaches HEAD; `None` if neither names one.
 fn current_branch(path: &Path) -> Option<String> {
-    git::run(path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .ok()
-        .map(|branch| branch.trim().to_owned())
+    if let Ok(branch) = git::run(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        return Some(branch.trim().to_owned());
+    }
+    ["rebase-merge/head-name", "rebase-apply/head-name"]
+        .into_iter()
+        .find_map(|name| {
+            let file = git::run(path, &["rev-parse", "--git-path", name]).ok()?;
+            let head = std::fs::read_to_string(path.join(file.trim())).ok()?;
+            head.trim().strip_prefix("refs/heads/").map(str::to_owned)
+        })
 }
 
 /// The default branch as the Checkout at `path` knows it: the remote's
-/// HEAD, else a local `main` or `master`, else the current Branch.
-fn default_branch(path: &Path, current: Option<&str>) -> String {
+/// HEAD, else a local `main` or `master`, else its only local Branch.
+fn default_branch(path: &Path) -> Option<String> {
     if let Ok(head) = git::run(
         path,
         &[
@@ -138,15 +155,23 @@ fn default_branch(path: &Path, current: Option<&str>) -> String {
         ],
     ) && let Some(branch) = head.trim().strip_prefix("origin/")
     {
-        return branch.to_owned();
+        return Some(branch.to_owned());
     }
     for branch in ["main", "master"] {
         let local = format!("refs/heads/{branch}");
         if git::run(path, &["rev-parse", "--verify", "--quiet", &local]).is_ok() {
-            return branch.to_owned();
+            return Some(branch.to_owned());
         }
     }
-    current.unwrap_or("main").to_owned()
+    let branches = git::run(
+        path,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    .ok()?;
+    match branches.lines().collect::<Vec<_>>().as_slice() {
+        [only] => Some((*only).to_owned()),
+        _ => None,
+    }
 }
 
 impl Checkout {
@@ -157,18 +182,19 @@ impl Checkout {
     }
 
     /// The `branch` a Recollection written here records: `None` on the
-    /// default branch, and on a detached HEAD, which is on no Branch.
-    pub fn recorded_branch(&self) -> Option<&str> {
-        self.branch
-            .as_deref()
-            .filter(|branch| *branch != self.default_branch)
+    /// default branch, else the Branch's ID (SPEC §4.1). Also `None` on a
+    /// detached HEAD, where no Recollection can be written.
+    pub fn branch_id(&self) -> Option<String> {
+        let branch = self.branch.as_deref()?;
+        (self.default_branch.as_deref() != Some(branch)).then(|| self.repository.branch(branch))
     }
 }
 
 /// Makes sure the brain has an Entity for the Checkout's Repository, creating
 /// it in a commit with `Author: server` if not (SPEC §2 step 4), and records
 /// the Checkout in the index. A Repository the brain already has gives the
-/// Checkout its `default_branch`. Returns whether the index took the change.
+/// Checkout its `default_branch`, or takes the Checkout's if it had none.
+/// Returns whether the index took every change.
 pub fn settle(
     brain: &Brain,
     index: &mut Index,
@@ -176,34 +202,42 @@ pub fn settle(
     checkout: &mut Checkout,
 ) -> Result<bool, WriteError> {
     let mut indexed = true;
-    let file = checkout.repository.file();
-    let full = brain.root().join(&file);
-    let existing = std::fs::read_to_string(&full).ok();
-    let existing = match existing {
-        Some(text) => Some(text),
+    let full = brain.root().join(checkout.repository.file());
+    let known = std::fs::read_to_string(&full)
+        .ok()
+        .and_then(|text| repository_fields(checkout, &text));
+    match known.and_then(|fields| fields.default_branch) {
+        Some(default_branch) => checkout.default_branch = Some(default_branch),
         None => {
             let lock = WriteLock::take(brain.root(), lock_timeout)?;
-            // Another `serve` may have made it while this one waited.
-            match std::fs::read_to_string(&full) {
-                Ok(text) => Some(text),
-                Err(_) => {
-                    indexed = create_repository(brain, index, &lock, checkout)?;
-                    None
-                }
-            }
+            // Read again under the lock: another `serve` may have written it.
+            let text = std::fs::read_to_string(&full).ok();
+            indexed = match text {
+                None => create_repository(brain, index, &lock, checkout)?,
+                Some(text) => match repository_fields(checkout, &text) {
+                    Some(fields) => match fields.default_branch {
+                        Some(default_branch) => {
+                            checkout.default_branch = Some(default_branch);
+                            true
+                        }
+                        None => learn_default_branch(brain, index, &lock, checkout, &text)?,
+                    },
+                    // A broken file is the owner's to repair (SPEC §10).
+                    None => true,
+                },
+            };
         }
-    };
-    if let Some(text) = existing
-        && let Ok(Entity {
-            fields: Fields::Repository(fields),
-            ..
-        }) = Entity::parse(&checkout.repository, &text)
-        && let Some(default_branch) = fields.default_branch
-    {
-        checkout.default_branch = default_branch;
     }
-    index.record_checkout(&checkout.path, &checkout.repository.to_string())?;
+    index.record_checkout(&checkout.path, &checkout.repository)?;
     Ok(indexed)
+}
+
+/// The front-matter of the Checkout's Repository file `text`, if it parses.
+fn repository_fields(checkout: &Checkout, text: &str) -> Option<crate::entity::Repository> {
+    match Entity::parse(&checkout.repository, text).ok()?.fields {
+        Fields::Repository(fields) => Some(fields),
+        Fields::Dependency(_) => None,
+    }
 }
 
 /// Commits a new Repository Entity for `checkout`.
@@ -216,25 +250,38 @@ fn create_repository(
     let id = &checkout.repository;
     let mut entity = Entity::new(id, &checkout.name, "");
     if let Fields::Repository(fields) = &mut entity.fields {
-        fields.default_branch = Some(checkout.default_branch.clone());
+        fields.default_branch = checkout.default_branch.clone();
     }
-    let message = format!(
-        "Create repository: {}\n\nRepository: {id}\nAction: create_entity\nAuthor: server\n",
-        checkout.name
-    );
-    let change = FileChange {
-        path: ItemId::Entity(id.clone()).file(),
-        before: None,
-        after: Some(entity.render()),
+    let change = Change::CreatedEntity { reference: None };
+    Ok(write::by_server(brain, index, lock, change, id, entity)?.indexed)
+}
+
+/// Records the Checkout's default branch in a Repository whose file `text`
+/// has none, if the Checkout knows it.
+fn learn_default_branch(
+    brain: &Brain,
+    index: &mut Index,
+    lock: &WriteLock,
+    checkout: &Checkout,
+    text: &str,
+) -> Result<bool, WriteError> {
+    let id = &checkout.repository;
+    let (Some(default_branch), Ok(mut entity)) =
+        (&checkout.default_branch, Entity::parse(id, text))
+    else {
+        return Ok(true);
     };
-    let (_, indexed) = write::commit(brain.root(), index, lock, &[change], &message)?;
-    Ok(indexed)
+    if let Fields::Repository(fields) = &mut entity.fields {
+        fields.default_branch = Some(default_branch.clone());
+    }
+    Ok(write::by_server(brain, index, lock, Change::UpdatedEntity, id, entity)?.indexed)
 }
 
 /// The Repository ID of the remote at `url`: its host lower-cased, `.git`
 /// removed from the end, and SSH and HTTPS forms brought to one
-/// `host/owner/name` form (SPEC §4.1). `None` if `url` isn't a remote with
-/// exactly an owner and a name.
+/// `host/owner/name` form, or a deeper path such as a GitLab subgroup's
+/// (SPEC §4.1). `None` if `url` isn't a hosted remote with at least an owner
+/// and a name, such as a path on this machine.
 pub fn repository_of_remote(url: &str) -> Option<EntityId> {
     let (host, path) = match url.split_once("://") {
         Some((scheme, rest)) => {
@@ -292,6 +339,14 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_with_a_deeper_path_keeps_all_of_it() {
+        assert_eq!(
+            repository_of_remote("git@gitlab.com:group/subgroup/api.git").map(|id| id.to_string()),
+            Some("repo:gitlab.com/group/subgroup/api".to_owned())
+        );
+    }
+
+    #[test]
     fn remotes_without_an_owner_and_a_name_have_no_repository_id() {
         for url in [
             "",
@@ -299,7 +354,6 @@ mod tests {
             "../api.git",
             "file:///srv/git/api.git",
             "https://github.com/api",
-            "https://gitlab.com/group/subgroup/api.git",
             "git@github.com:",
         ] {
             assert_eq!(repository_of_remote(url), None, "{url}");

@@ -1,0 +1,10 @@
+---
+source: tests/checkout.rs
+assertion_line: 528
+expression: "test.git(&brain, &[\"log\", \"-1\", \"--format=%B\"])"
+---
+Update repository: api
+
+Repository: repo:github.com/Owner/api
+Action: update_entity
+Author: server

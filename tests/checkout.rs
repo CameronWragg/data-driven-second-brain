@@ -176,7 +176,10 @@ async fn a_recollection_written_on_a_branch_is_found_only_there_unless_asked_for
     let id = written.split_whitespace().nth(3).unwrap().to_owned();
 
     let file = fs::read_to_string(brain.join(format!("recollections/{id}.md"))).unwrap();
-    assert!(file.contains("branch: feature/x"), "{file}");
+    assert!(
+        file.contains("branch: repo:github.com/Owner/api#feature/x"),
+        "{file}"
+    );
     let message = test.git(&brain, &["log", "-1", "--format=%B"]);
     redacted().bind(|| insta::assert_snapshot!(message));
     assert!(
@@ -198,7 +201,10 @@ async fn a_recollection_written_on_a_branch_is_found_only_there_unless_asked_for
     )
     .await;
     assert!(labelled.contains(&format!("id=\"{id}\"")), "{labelled}");
-    assert!(labelled.contains("branch=\"feature/x\""), "{labelled}");
+    assert!(
+        labelled.contains("branch=\"repo:github.com/Owner/api#feature/x\""),
+        "{labelled}"
+    );
     assert!(
         search_ids(&client, json!({ "query": "shadow", "branches": "all" }))
             .await
@@ -391,5 +397,182 @@ async fn get_on_an_entity_lists_ten_recollections_about_it_then_how_many_more() 
     assert_eq!(got.matches("<recollection id=").count(), 10, "{got}");
     assert!(got.contains("+2 more"), "{got}");
     assert!(got.contains("`entities: [\"dep:npm:prisma\"]`"), "{got}");
+    client.cancel().await.unwrap();
+}
+
+/// The ID of the Recollection a one-operation `write` result created.
+fn created_id(written: &str) -> String {
+    written.split_whitespace().nth(3).unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn a_branch_of_one_repository_never_brings_in_another_repositorys_branch_of_that_name() {
+    let test = TestBrain::new();
+    test.init();
+    test.place_entity(PRISMA_PATH, PRISMA);
+    let api = test.checkout("api", Some(API_SSH));
+    let web = test.checkout("web", Some("git@github.com:Owner/web.git"));
+    test.git(&web, &["checkout", "--quiet", "-b", "feature/x"]);
+    let web_client = test.serve_in(&web).await;
+    let in_web = created_id(
+        &write_ok(
+            &web_client,
+            json!([caveat("Shadow in web", "dep:npm:prisma")]),
+        )
+        .await,
+    );
+    web_client.cancel().await.unwrap();
+    test.git(&api, &["checkout", "--quiet", "-b", "feature/x"]);
+    let client = test.serve_in(&api).await;
+
+    let everywhere = search_ids(&client, json!({ "query": "shadow", "scope": "all" })).await;
+    let by_name = search_ids(
+        &client,
+        json!({ "query": "shadow", "scope": "all", "branches": ["feature/x"] }),
+    )
+    .await;
+
+    assert!(!everywhere.contains(&in_web), "{everywhere:?}");
+    assert!(by_name.contains(&in_web), "{by_name:?}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_detached_head_rejects_new_recollections_but_a_rebase_names_its_branch() {
+    let test = TestBrain::new();
+    let brain = test.init();
+    let api = test.checkout("api", Some(API_SSH));
+    test.git(&api, &["checkout", "--quiet", "-b", "feature/x"]);
+    fs::write(api.join("README.md"), "# api on feature/x\n").unwrap();
+    test.git(
+        &api,
+        &["commit", "--quiet", "--all", "--message", "Feature"],
+    );
+    test.git(&api, &["checkout", "--quiet", "main"]);
+    fs::write(api.join("README.md"), "# api on main\n").unwrap();
+    test.git(&api, &["commit", "--quiet", "--all", "--message", "Main"]);
+    test.git(&api, &["checkout", "--quiet", "--detach", "HEAD"]);
+    let client = test.serve_in(&api).await;
+
+    let (is_error, detached) = call(
+        &client,
+        "write",
+        json!({ "operations": [caveat("Shadow while detached", API)] }),
+    )
+    .await;
+    let (_, context) = call(&client, "context", json!({})).await;
+
+    assert!(
+        is_error && detached.contains("HEAD is detached"),
+        "{detached}"
+    );
+    assert!(context.contains("HEAD is detached"), "{context}");
+    test.git(&api, &["checkout", "--quiet", "feature/x"]);
+    // The rebase stops on the conflict in README.md, with HEAD detached.
+    let rebase = test
+        .command("git")
+        .current_dir(&api)
+        .args(["rebase", "--quiet", "main"])
+        .output()
+        .unwrap();
+    assert!(!rebase.status.success());
+    let written = write_ok(&client, json!([caveat("Shadow mid-rebase", API)])).await;
+    let file = fs::read_to_string(brain.join(format!("recollections/{}.md", created_id(&written))))
+        .unwrap();
+    assert!(
+        file.contains("branch: repo:github.com/Owner/api#feature/x"),
+        "{file}"
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unknown_default_branch_is_reported_then_learned_once_the_checkout_knows_it() {
+    let test = TestBrain::new();
+    let brain = test.init();
+    let api = test.checkout("api", Some(API_SSH));
+    test.git(&api, &["branch", "--quiet", "--move", "main", "trunk"]);
+    test.git(&api, &["checkout", "--quiet", "-b", "feature/x"]);
+    let client = test.serve_in(&api).await;
+
+    let text = context(&client, &api).await;
+    let written = write_ok(&client, json!([caveat("Shadow without a default", API)])).await;
+    client.cancel().await.unwrap();
+
+    let home = test.home().display().to_string();
+    insta::assert_snapshot!(text.replace(&home, "[HOME]"));
+    let file = fs::read_to_string(brain.join(format!("recollections/{}.md", created_id(&written))))
+        .unwrap();
+    assert!(
+        file.contains("branch: repo:github.com/Owner/api#feature/x"),
+        "{file}"
+    );
+    let commits = test.git(&brain, &["rev-list", "--count", "HEAD"]);
+    test.git(
+        &api,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
+    );
+    let again = test.serve_in(&api).await;
+    let learned = context(&again, &api).await;
+    again.cancel().await.unwrap();
+    assert!(learned.contains("default branch: trunk"), "{learned}");
+    let count: u32 = commits.trim().parse().unwrap();
+    assert_eq!(
+        test.git(&brain, &["rev-list", "--count", "HEAD"]),
+        format!("{}\n", count + 1)
+    );
+    insta::assert_snapshot!(test.git(&brain, &["log", "-1", "--format=%B"]));
+}
+
+#[tokio::test]
+async fn context_with_a_path_that_cant_be_read_keeps_the_checkout_it_had() {
+    let test = TestBrain::new();
+    test.init();
+    let api = test.checkout("api", Some(API_SSH));
+    let client = test.serve_in(&api).await;
+
+    let (is_error, text) = call(&client, "context", json!({ "path": "no/such/folder" })).await;
+    let after = context(&client, &api).await;
+
+    assert!(!is_error, "{text}");
+    assert!(
+        text.contains("Problem: ") && text.contains("nothing above changed"),
+        "{text}"
+    );
+    assert_eq!(repository(&text), API);
+    assert_eq!(repository(&after), API);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_insteadof_remote_is_rewritten_before_it_is_normalised() {
+    let test = TestBrain::new();
+    test.init();
+    let api = test.checkout("api", Some("gh:Owner/api.git"));
+    test.git(&api, &["config", "url.git@github.com:.insteadOf", "gh:"]);
+    let client = test.serve_in(&api).await;
+
+    assert_eq!(repository(&context(&client, &api).await), API);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_origin_on_this_machine_gives_a_local_id_and_says_why() {
+    let test = TestBrain::new();
+    test.init();
+    let api = test.checkout("api", Some("/srv/git/api.git"));
+    let client = test.serve_in(&api).await;
+
+    let text = context(&client, &api).await;
+
+    assert!(repository(&text).starts_with("repo:local/"), "{text}");
+    assert!(
+        text.contains("Its origin, /srv/git/api.git, isn't a hosted remote"),
+        "{text}"
+    );
     client.cancel().await.unwrap();
 }
