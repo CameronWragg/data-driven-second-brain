@@ -1,7 +1,7 @@
 //! The IDs of things in the Second Brain (SPEC §4.1), and the files they live in.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ulid::Ulid;
 
@@ -42,6 +42,25 @@ impl ItemId {
             ItemId::Recollection(id) => recollection_file(*id),
             ItemId::Entity(id) => id.file(),
         }
+    }
+
+    /// The item whose file is `path`, relative to the brain folder, or `None`
+    /// if no item lives there.
+    pub fn from_file(path: &str) -> Option<ItemId> {
+        let stem = path.strip_suffix(".md")?;
+        let id = if let Some(ulid) = stem.strip_prefix("recollections/") {
+            ulid.to_owned()
+        } else if let Some(repository) = stem.strip_prefix("entities/repositories/") {
+            format!("repo:{repository}")
+        } else {
+            let (ecosystem, name) = stem
+                .strip_prefix("entities/dependencies/")?
+                .split_once('/')?;
+            format!("dep:{ecosystem}:{name}")
+        };
+        // Only the file the ID maps back to, so `recollections/01jb….md`
+        // isn't taken for `recollections/01JB….md`.
+        ItemId::parse(&id).filter(|parsed| parsed.file() == Path::new(path))
     }
 }
 
@@ -139,6 +158,38 @@ mod tests {
 
             assert_eq!(parsed.file(), PathBuf::from(file));
             assert_eq!(parsed.to_string(), id);
+        }
+    }
+
+    #[test]
+    fn a_file_gives_back_the_id_of_the_item_that_lives_there() {
+        for id in [
+            "repo:github.com/cameronwragg/api",
+            "dep:npm:prisma",
+            "dep:npm:@prisma/client",
+            "01JB3K8V9Q0000000000000000",
+        ] {
+            let parsed = ItemId::parse(id).unwrap();
+
+            let file = parsed.file();
+
+            assert_eq!(ItemId::from_file(file.to_str().unwrap()), Some(parsed));
+        }
+    }
+
+    #[test]
+    fn files_where_no_item_lives_have_no_id() {
+        for path in [
+            "brain.toml",
+            "recollections/notes.md",
+            "recollections/01jb3k8v9q0000000000000000.md",
+            "recollections/01JB3K8V9Q0000000000000000.txt",
+            "entities/repositories/github.com/owner.md",
+            "entities/dependencies/npm/a/b/c.md",
+            "entities/dependencies/npm/.hidden.md",
+            "eval/queries.yaml",
+        ] {
+            assert_eq!(ItemId::from_file(path), None, "{path}");
         }
     }
 

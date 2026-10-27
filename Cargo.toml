@@ -16,18 +16,20 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 humantime = "2.4.0"
 rmcp = { version = "3.8.0", features = ["server", "macros", "transport-io"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde-saphyr = "2.0.0"
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
 toml_edit = { version = "0.25.17", features = ["serde"] }
 ulid = "3.0.0"
 
 [dev-dependencies]
 insta = { version = "1.49.0", features = ["filters"] }
+proptest = "1.12.0"
 rmcp = { version = "3.8.0", features = ["client", "transport-child-process"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["process"] }

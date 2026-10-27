@@ -5,9 +5,12 @@ pub mod config;
 pub mod get;
 mod git;
 pub mod id;
+pub mod identifiers;
+pub mod index;
 mod init;
 pub mod lock;
 pub mod recollection;
+mod reindex;
 mod serve;
 pub mod write;
 
@@ -59,7 +62,7 @@ pub fn run(cli: Cli) -> ExitCode {
             return report("init", init::run(no_remote, path));
         }
         Command::Serve => return report("serve", serve::run()),
-        Command::Reindex => "reindex",
+        Command::Reindex => return report("reindex", reindex::run()),
         Command::Eval => "eval",
         Command::Hook(Hook::Stop) => "hook stop",
     };

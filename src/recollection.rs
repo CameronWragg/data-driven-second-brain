@@ -18,6 +18,14 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const ALL: [Kind; 5] = [
+        Kind::Decision,
+        Kind::Convention,
+        Kind::Caveat,
+        Kind::Architecture,
+        Kind::HowTo,
+    ];
+
     /// The level-2 headings a body of this Kind must have.
     pub fn required_sections(self) -> &'static [&'static str] {
         match self {
@@ -127,22 +135,23 @@ impl Recollection {
     }
 
     pub fn parse(text: &str) -> Result<Recollection, ParseError> {
-        let rest = text
-            .strip_prefix("---\n")
-            .ok_or(ParseError::NoFrontMatter)?;
-        let (yaml, body) = match rest.split_once("\n---\n") {
-            Some((yaml, body)) => (yaml, body),
-            None => (
-                rest.strip_suffix("\n---")
-                    .ok_or(ParseError::NoFrontMatter)?,
-                "",
-            ),
-        };
+        let (yaml, body) = split_front_matter(text).ok_or(ParseError::NoFrontMatter)?;
         Ok(Recollection {
             front_matter: serde_saphyr::from_str(yaml)?,
-            body: body.trim_start_matches('\n').to_owned(),
+            body: body.to_owned(),
         })
     }
+}
+
+/// Splits an Item's file into its YAML front-matter and its body, or `None`
+/// if it doesn't start with a `---` block.
+pub fn split_front_matter(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("---\n")?;
+    let (yaml, body) = match rest.split_once("\n---\n") {
+        Some((yaml, body)) => (yaml, body),
+        None => (rest.strip_suffix("\n---")?, ""),
+    };
+    Some((yaml, body.trim_start_matches('\n')))
 }
 
 /// The concurrency `version` of a file: a hash of its content (SPEC §5.1).

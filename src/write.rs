@@ -14,6 +14,7 @@ use ulid::Ulid;
 use crate::brain::Brain;
 use crate::git::{self, GitError};
 use crate::id::{self, EntityId, ItemId};
+use crate::index::{Index, IndexError, Staged};
 use crate::lock::{LockError, WriteLock};
 use crate::recollection::{self, FrontMatter, Kind, Link, LinkType, Recollection, State};
 
@@ -205,6 +206,8 @@ pub enum WriteError {
     Io { path: PathBuf, source: io::Error },
     #[error(transparent)]
     Git(#[from] GitError),
+    #[error(transparent)]
+    Index(#[from] IndexError),
 }
 
 /// A committed batch.
@@ -261,14 +264,16 @@ impl Change {
 }
 
 /// Checks `operations` and, if every one passes, writes them as one commit
-/// under the write lock. `now` is when the batch is written.
+/// under the write lock, updating `index` to match. `now` is when the batch
+/// is written.
 pub fn write(
     brain: &Brain,
+    index: &mut Index,
     operations: Vec<Operation>,
     lock_timeout: Duration,
     now: SystemTime,
 ) -> Result<Written, WriteError> {
-    let _lock = WriteLock::take(brain.root(), lock_timeout)?;
+    let lock = WriteLock::take(brain.root(), lock_timeout)?;
     let mut batch = Batch::new(brain.root(), now);
     if operations.is_empty() {
         batch.problems.push(Problem {
@@ -307,7 +312,13 @@ pub fn write(
             });
         }
     }
-    let commit = commit(brain.root(), &changes, &message(&batch.outcomes))?;
+    let commit = commit(
+        brain.root(),
+        index,
+        &lock,
+        &changes,
+        &message(&batch.outcomes),
+    )?;
     Ok(Written {
         outcomes: batch.outcomes,
         versions,
@@ -934,39 +945,65 @@ struct FileChange {
     after: Option<String>,
 }
 
-/// Applies `changes` and commits exactly them. If the commit fails, the files
-/// are put back as they were so nothing is left half-written.
-fn commit(root: &Path, changes: &[FileChange], message: &str) -> Result<String, WriteError> {
+/// Applies `changes`, to the files and then the index, and commits exactly
+/// them. If the commit fails, the files and index are put back as they were
+/// so nothing is left half-written.
+fn commit(
+    root: &Path,
+    index: &mut Index,
+    lock: &WriteLock,
+    changes: &[FileChange],
+    message: &str,
+) -> Result<String, WriteError> {
     let paths: Vec<&str> = changes
         .iter()
         .map(|change| change.path.to_str().expect("brain paths are UTF-8"))
         .collect();
-    let result = (|| {
-        for change in changes {
-            put(root, &change.path, change.after.as_deref())?;
-        }
-        // `add` stages a deleted path's removal too.
-        let mut add = vec!["add", "--"];
-        add.extend(&paths);
-        git::run(root, &add)?;
-        // Naming the paths commits only them, never a hand edit that happens
-        // to be staged.
-        let mut commit = vec!["commit", "--quiet", "--message", message, "--"];
-        commit.extend(&paths);
-        git::run(root, &commit)?;
-        Ok::<_, WriteError>(())
-    })();
+    let result = apply(root, index, lock, changes, &paths, message);
     if result.is_err() {
         for change in changes {
             let _ = put(root, &change.path, change.before.as_deref());
         }
         let mut reset = vec!["reset", "--quiet", "--"];
-        reset.extend(&paths);
+        reset.extend(paths);
         let _ = git::run(root, &reset);
     }
-    result?;
-    // The batch has landed, so a failure from here on must not undo it.
+    // The batch has landed, so a failure from here on must not undo it. An
+    // index left behind is caught up at the next startup, by the hashes.
+    let _ = result?.commit();
     Ok(git::run(root, &["rev-parse", "HEAD"])?.trim().to_owned())
+}
+
+/// The part of `commit` that `commit` undoes if it fails: `paths` are the
+/// paths of `changes`.
+fn apply<'a>(
+    root: &Path,
+    index: &'a mut Index,
+    lock: &WriteLock,
+    changes: &[FileChange],
+    paths: &[&str],
+    message: &str,
+) -> Result<Staged<'a>, WriteError> {
+    for change in changes {
+        put(root, &change.path, change.after.as_deref())?;
+    }
+    let staged = index.stage(
+        lock,
+        paths
+            .iter()
+            .zip(changes)
+            .map(|(path, change)| (*path, change.after.as_deref())),
+    )?;
+    // `add` stages a deleted path's removal too.
+    let mut add = vec!["add", "--"];
+    add.extend(paths);
+    git::run(root, &add)?;
+    // Naming the paths commits only them, never a hand edit that happens to be
+    // staged.
+    let mut commit = vec!["commit", "--quiet", "--message", message, "--"];
+    commit.extend(paths);
+    git::run(root, &commit)?;
+    Ok(staged)
 }
 
 /// Writes `text` to `path` under `root`, or removes the file if it's `None`.
