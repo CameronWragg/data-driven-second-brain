@@ -29,7 +29,7 @@ A Recollection or an Entity: anything in the Second Brain that has an ID and a f
 _Avoid_: Record, object, file
 
 **Kind**:
-The category of a Recollection: decision, convention, caveat, architecture or how-to.
+The category of a Recollection: decision, convention, caveat, architecture or how-to. Where results list Items, an Entity's kind is `repository` or `dependency`, which are not Kinds.
 _Avoid_: Type, category, gotcha, pitfall
 
 **Anchor**:

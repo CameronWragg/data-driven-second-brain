@@ -215,6 +215,12 @@ pub enum WriteError {
 pub struct Written {
     /// One per operation, in order.
     pub outcomes: Vec<Outcome>,
+    /// The other Recollections the batch changed so that their Links follow
+    /// one it removed (SPEC §5.1).
+    pub followed: Vec<Followed>,
+    /// Links to a Recollection the batch removed that stay, because the file
+    /// they start from no longer parses.
+    pub links_left: Vec<LinkLeft>,
     /// The new `version` of every Recollection the batch left in place.
     pub versions: BTreeMap<Ulid, String>,
     /// The commit's SHA.
@@ -222,6 +228,23 @@ pub struct Written {
     /// Whether the index took the batch too. If not, the files are still
     /// written and committed, and the index must be refreshed from them.
     pub indexed: bool,
+}
+
+/// A Recollection no operation names that the batch changed so its Links
+/// follow one the batch removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Followed {
+    pub id: Ulid,
+    pub kind: Kind,
+    pub title: String,
+}
+
+/// A Link from `from` to `to`, which the batch removed, that stays because
+/// `from`'s file no longer parses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkLeft {
+    pub from: Ulid,
+    pub to: Ulid,
 }
 
 /// What one operation did, to the Recollection it names: for a supersede,
@@ -299,6 +322,8 @@ pub fn write(
     if !batch.problems.is_empty() {
         return Err(WriteError::Rejected(batch.problems));
     }
+    batch.follow_links(index)?;
+    let message = message(&batch.outcomes, &batch.followed);
     let mut changes = Vec::new();
     let mut versions = BTreeMap::new();
     for (id, staged) in batch.staged {
@@ -315,15 +340,11 @@ pub fn write(
             });
         }
     }
-    let (commit, indexed) = commit(
-        brain.root(),
-        index,
-        &lock,
-        &changes,
-        &message(&batch.outcomes),
-    )?;
+    let (commit, indexed) = commit(brain.root(), index, &lock, &changes, &message)?;
     Ok(Written {
         outcomes: batch.outcomes,
+        followed: batch.followed,
+        links_left: batch.links_left,
         versions,
         commit,
         indexed,
@@ -347,7 +368,12 @@ struct Batch<'a> {
     staged: BTreeMap<Ulid, Option<Recollection>>,
     /// The ID each `ref` in the batch so far names.
     refs: BTreeMap<String, Ulid>,
+    /// Each Recollection the batch removes, with the one that replaces it, if
+    /// any.
+    removed: BTreeMap<Ulid, Option<Ulid>>,
     outcomes: Vec<Outcome>,
+    followed: Vec<Followed>,
+    links_left: Vec<LinkLeft>,
     problems: Vec<Problem>,
 }
 
@@ -362,7 +388,10 @@ impl<'a> Batch<'a> {
             disk: BTreeMap::new(),
             staged: BTreeMap::new(),
             refs: BTreeMap::new(),
+            removed: BTreeMap::new(),
             outcomes: Vec::new(),
+            followed: Vec::new(),
+            links_left: Vec::new(),
             problems: Vec::new(),
         }
     }
@@ -395,7 +424,6 @@ impl<'a> Batch<'a> {
         self.check_unexpected("replacement", &replacement.unexpected, &SERVER_FILLED);
         let target = self.target(&supersede.id, &supersede.version)?;
         if let Some((old, _)) = &target {
-            self.check_not_linked_to(*old);
             let old = old.to_string();
             let resolved: Vec<_> = replacement
                 .links
@@ -420,6 +448,7 @@ impl<'a> Batch<'a> {
         if self.problems.len() == before {
             self.outcome(Change::Superseded { old, reference }, id, &recollection);
             self.staged.insert(old, None);
+            self.removed.insert(old, Some(id));
         }
         Ok(())
     }
@@ -428,14 +457,12 @@ impl<'a> Batch<'a> {
         let before = self.problems.len();
         self.check_unexpected("delete", &delete.unexpected, &[]);
         let target = self.target(&delete.id, &delete.version)?;
-        if let Some((id, _)) = &target {
-            self.check_not_linked_to(*id);
-        }
         if let Some((id, recollection)) = target
             && self.problems.len() == before
         {
             self.outcome(Change::Deleted, id, &recollection);
             self.staged.insert(id, None);
+            self.removed.insert(id, None);
         }
         Ok(())
     }
@@ -836,22 +863,93 @@ impl<'a> Batch<'a> {
         }
     }
 
-    /// Checks that no Recollection the batch writes Links to `id`, which an
-    /// operation deletes.
-    fn check_not_linked_to(&mut self, id: Ulid) {
-        let to = id.to_string();
-        let linking: Vec<Ulid> = self
-            .staged
-            .iter()
-            .filter_map(|(from, staged)| {
-                let links = &staged.as_ref()?.front_matter.links;
-                links.iter().any(|link| link.to == to).then_some(*from)
-            })
-            .collect();
-        for from in linking {
-            self.schema(format!(
-                "{from}, which this batch writes, Links to {id}; remove that Link or keep {id}"
-            ));
+    /// Makes every `relates-to` Link to a Recollection the batch removes
+    /// follow it: to its replacement, or out of the file (SPEC §5.1). The
+    /// Links are found in the Recollections the batch writes and, through
+    /// `index`, in every other.
+    fn follow_links(&mut self, index: &Index) -> Result<(), WriteError> {
+        if self.removed.is_empty() {
+            return Ok(());
+        }
+        let mut sources: Vec<Ulid> = self.staged.keys().copied().collect();
+        for removed in self.removed.keys() {
+            for source in index.linking_to(&removed.to_string(), LinkType::RelatesTo)? {
+                if let Some(ItemId::Recollection(source)) = ItemId::parse(&source)
+                    && !sources.contains(&source)
+                {
+                    sources.push(source);
+                }
+            }
+        }
+        for source in sources {
+            let (mut recollection, staged) = match self.staged.get(&source) {
+                Some(Some(recollection)) => (recollection.clone(), true),
+                Some(None) => continue,
+                None => {
+                    // The index may be behind a hand edit that removed the file.
+                    let Some(text) = self.read(source)? else {
+                        continue;
+                    };
+                    match Recollection::parse(&text) {
+                        Ok(recollection) => (recollection, false),
+                        Err(_) => {
+                            self.leave_links(source, &text);
+                            continue;
+                        }
+                    }
+                }
+            };
+            let links = &recollection.front_matter.links;
+            let followed = self.followed_links(source, links);
+            if followed == *links {
+                continue;
+            }
+            recollection.front_matter.links = followed;
+            if !staged {
+                recollection.front_matter.updated = self.timestamp.clone();
+                self.followed.push(Followed {
+                    id: source,
+                    kind: recollection.front_matter.kind,
+                    title: recollection.front_matter.title.clone(),
+                });
+            }
+            self.staged.insert(source, Some(recollection));
+        }
+        Ok(())
+    }
+
+    /// `links`, the Links of Recollection `source`, with each to a removed
+    /// Recollection repointed at its replacement or dropped, and none
+    /// repeated or to `source` itself.
+    fn followed_links(&self, source: Ulid, links: &[Link]) -> Vec<Link> {
+        let mut followed: Vec<Link> = Vec::new();
+        for link in links {
+            let mut link = link.clone();
+            if link.link_type == LinkType::RelatesTo
+                && let Some(ItemId::Recollection(to)) = ItemId::parse(&link.to)
+                && let Some(&replacement) = self.removed.get(&to)
+            {
+                // A replacement is never removed in its own batch, since only
+                // a `ref` names it there and removing takes an ID.
+                match replacement {
+                    Some(replacement) if replacement != source => link.to = replacement.to_string(),
+                    _ => continue,
+                }
+            }
+            if !followed.contains(&link) {
+                followed.push(link);
+            }
+        }
+        followed
+    }
+
+    /// Records each `relates-to` Link to a removed Recollection that stays in
+    /// `source`, whose file `text` no longer parses.
+    fn leave_links(&mut self, source: Ulid, text: &str) {
+        for &to in self.removed.keys() {
+            if text.contains(&to.to_string()) {
+                self.links_left.push(LinkLeft { from: source, to });
+            }
         }
     }
 
@@ -900,7 +998,7 @@ fn entity_exists(root: &Path, id: &str) -> bool {
 }
 
 /// The commit message for a batch: a generated subject, then trailers (SPEC §5.3).
-fn message(outcomes: &[Outcome]) -> String {
+fn message(outcomes: &[Outcome], followed: &[Followed]) -> String {
     let mut ids: Vec<Ulid> = Vec::new();
     let mut actions: Vec<&str> = Vec::new();
     for outcome in outcomes {
@@ -925,6 +1023,13 @@ fn message(outcomes: &[Outcome]) -> String {
         (_, count, _) => format!("Change {count} Recollections"),
     };
     let mut message = format!("{subject}\n\n");
+    // Recollections changed only to follow Links are part of the batch too
+    // (SPEC §5.1), though the subject names what the operations did.
+    for followed in followed {
+        if !ids.contains(&followed.id) {
+            ids.push(followed.id);
+        }
+    }
     for id in &ids {
         message.push_str(&format!("Recollection: {id}\n"));
     }

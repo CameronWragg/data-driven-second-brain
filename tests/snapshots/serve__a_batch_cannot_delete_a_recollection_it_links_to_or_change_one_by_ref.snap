@@ -1,9 +1,0 @@
----
-source: tests/serve.rs
-assertion_line: 740
-expression: text
----
-rejected: the batch failed its checks, so nothing was written
-- operation 1 (schema): [ULID], which this batch writes, Links to [ULID]; remove that Link or keep [ULID]
-- operation 2 (schema): ref:new can only name a Link's `to`; give a new Recollection its Links in its own `create`
-Fix every problem above and send the whole batch again.

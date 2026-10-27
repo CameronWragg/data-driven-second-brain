@@ -714,23 +714,18 @@ async fn every_problem_in_a_batch_of_mixed_operations_is_reported_at_once() {
 }
 
 #[tokio::test]
-async fn a_batch_cannot_delete_a_recollection_it_links_to_or_change_one_by_ref() {
+async fn a_batch_cannot_change_a_recollection_by_ref() {
     let test = TestBrain::new();
     let client = serving_prisma(&test).await;
-    let (old, version) = create_caveat(&client, "Prisma migrations fail silently").await;
-    let mut linking = prisma_caveat("Prisma needs a shadow database");
-    linking["ref"] = json!("new");
-    linking["links"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({ "type": "relates-to", "to": old }));
+    let (_, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let mut created = prisma_caveat("Prisma needs a shadow database");
+    created["ref"] = json!("new");
 
     let (is_error, text) = call(
         &client,
         "write",
         json!({ "operations": [
-            linking,
-            { "op": "delete", "id": old, "version": version },
+            created,
             { "op": "update", "id": "ref:new", "version": version, "title": "Renamed" },
         ] }),
     )
@@ -738,6 +733,132 @@ async fn a_batch_cannot_delete_a_recollection_it_links_to_or_change_one_by_ref()
 
     assert!(is_error, "{text}");
     redacted().bind(|| insta::assert_snapshot!(text));
+    client.cancel().await.unwrap();
+}
+
+/// Creates a Prisma caveat titled `title` with a `relates-to` Link to `to`,
+/// returning its ID.
+async fn create_relating(client: &RunningService<RoleClient, ()>, title: &str, to: &str) -> String {
+    let mut caveat = prisma_caveat(title);
+    caveat["links"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "type": "relates-to", "to": to }));
+    id_and_version(&write_ok(client, json!([caveat])).await, 0).0
+}
+
+/// The `relates-to` Links in Recollection `id`'s file, as the IDs they point at.
+fn relates_to(test: &TestBrain, id: &str) -> Vec<String> {
+    let file = fs::read_to_string(recollection_file(test, id)).unwrap();
+    file.split("- type: relates-to\n  to: ")
+        .skip(1)
+        .map(|rest| rest.lines().next().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn supersede_points_relates_to_links_at_the_replacement_in_the_same_commit() {
+    let test = TestBrain::new();
+    let brain = test.default_brain();
+    let client = serving_prisma(&test).await;
+    let (old, old_version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let linking = create_relating(&client, "Prisma needs a shadow database", &old).await;
+
+    let written = write_ok(
+        &client,
+        json!([{
+            "op": "supersede",
+            "id": old,
+            "version": old_version,
+            "replacement": replacement("Prisma migrations need a shadow database"),
+        }]),
+    )
+    .await;
+
+    let (new, _) = id_and_version(&written, 0);
+    assert_eq!(relates_to(&test, &linking), std::slice::from_ref(&new));
+    redacted().bind(|| insta::assert_snapshot!(written));
+    let file = fs::read_to_string(recollection_file(&test, &linking)).unwrap();
+    let version = written
+        .lines()
+        .find(|line| line.contains(&linking))
+        .and_then(|line| line.rsplit("version ").next())
+        .map(|version| version.trim_end_matches(')'))
+        .unwrap();
+    assert_eq!(get_version(&client, &linking).await, version, "{written}");
+    let files = test.git(
+        &brain,
+        &["show", "--name-only", "--no-renames", "--format=", "HEAD"],
+    );
+    assert_eq!(files.lines().count(), 3, "{files}");
+    let message = test.git(&brain, &["log", "-1", "--format=%B"]);
+    for id in [&old, &new, &linking] {
+        assert!(
+            message.contains(&format!("Recollection: {id}\n")),
+            "{message}"
+        );
+    }
+    assert!(file.contains(&format!("to: {new}\n")), "{file}");
+    client.cancel().await.unwrap();
+}
+
+/// The `version` `get` gives for item `id`.
+async fn get_version(client: &RunningService<RoleClient, ()>, id: &str) -> String {
+    let (_, text) = call(client, "get", json!({ "ids": [id] })).await;
+    text.split("version=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn delete_removes_relates_to_links_to_it_even_from_recollections_the_batch_writes() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (old, old_version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let linking = create_relating(&client, "Prisma needs a shadow database", &old).await;
+    let mut created = prisma_caveat("Prisma needs a replica too");
+    created["links"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "type": "relates-to", "to": old }));
+
+    let written = write_ok(
+        &client,
+        json!([created, { "op": "delete", "id": old, "version": old_version }]),
+    )
+    .await;
+
+    let (created, _) = id_and_version(&written, 0);
+    assert_eq!(relates_to(&test, &linking), [] as [String; 0]);
+    assert_eq!(relates_to(&test, &created), [] as [String; 0]);
+    redacted().bind(|| insta::assert_snapshot!(written));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_link_to_a_removed_recollection_stays_in_a_file_that_no_longer_parses_with_a_warning() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (old, old_version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let linking = create_relating(&client, "Prisma needs a shadow database", &old).await;
+    let file = recollection_file(&test, &linking);
+    let broken = fs::read_to_string(&file)
+        .unwrap()
+        .replace("state: active", "state: [");
+    fs::write(&file, &broken).unwrap();
+
+    let written = write_ok(
+        &client,
+        json!([{ "op": "delete", "id": old, "version": old_version }]),
+    )
+    .await;
+
+    assert_eq!(fs::read_to_string(&file).unwrap(), broken);
+    redacted().bind(|| insta::assert_snapshot!(written));
     client.cancel().await.unwrap();
 }
 

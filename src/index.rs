@@ -163,6 +163,17 @@ impl Index {
         Ok(Staged(transaction))
     }
 
+    /// The IDs of the Items with a `link_type` Link to `target`.
+    pub fn linking_to(&self, target: &str, link_type: LinkType) -> Result<Vec<String>, IndexError> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT source FROM links WHERE target = ?1 AND type = ?2 ORDER BY source",
+        )?;
+        let sources = statement
+            .query_map([target, link_type.as_str()], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(sources)
+    }
+
     /// The Items matching `query`, best first.
     pub fn search(&self, query: &Query) -> Result<Vec<Hit>, IndexError> {
         let Some(matching) = match_expression(&query.text) else {

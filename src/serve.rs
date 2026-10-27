@@ -526,6 +526,23 @@ fn render_written(written: &Written) -> String {
             version_note(written, id, &reference)
         ));
     }
+    if !written.followed.is_empty() {
+        text.push_str("Also updated so their Links follow a removed Recollection:\n");
+        for followed in &written.followed {
+            let (kind, id, title) = (followed.kind.as_str(), followed.id, &followed.title);
+            text.push_str(&format!(
+                "- {kind} {id} \"{title}\"{}\n",
+                version_note(written, id, "")
+            ));
+        }
+    }
+    for left in &written.links_left {
+        text.push_str(&format!(
+            "Warning: {} still Links to {}, because its file no longer parses; the owner must \
+             repair it by hand.\n",
+            left.from, left.to
+        ));
+    }
     text.push_str(&format!("Commit: {}\n", written.commit));
     text
 }

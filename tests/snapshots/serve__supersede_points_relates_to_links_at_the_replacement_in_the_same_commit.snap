@@ -1,0 +1,8 @@
+---
+source: tests/serve.rs
+expression: written
+---
+0. superseded [ULID] with caveat [ULID] "Prisma migrations need a shadow database" (version [VERSION])
+Also updated so their Links follow a removed Recollection:
+- caveat [ULID] "Prisma needs a shadow database" (version [VERSION])
+Commit: [SHA]
