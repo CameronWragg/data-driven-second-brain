@@ -1,0 +1,11 @@
+---
+source: tests/serve.rs
+assertion_line: 111
+expression: message
+---
+Create 2 Recollections
+
+Recollection: [ULID]
+Recollection: [ULID]
+Action: create
+Author: agent

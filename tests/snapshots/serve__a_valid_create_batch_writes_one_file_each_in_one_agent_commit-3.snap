@@ -1,0 +1,35 @@
+---
+source: tests/serve.rs
+assertion_line: 117
+expression: "fs::read_to_string(file).unwrap()"
+---
+---
+id: [ULID]
+kind: caveat
+title: Prisma migrations fail silently
+summary: "`prisma migrate dev` exits 0 but applies nothing when SHADOW_DATABASE_URL is unset."
+state: active
+abandoned_at: null
+branch: null
+applies_to: {}
+tags:
+- migrations
+links:
+- type: about
+  to: dep:npm:prisma
+supersedes: []
+created: "[TIME]"
+updated: "[TIME]"
+---
+
+## Symptom
+
+No migration runs.
+
+## Cause
+
+No shadow database.
+
+## Avoidance
+
+Set SHADOW_DATABASE_URL.

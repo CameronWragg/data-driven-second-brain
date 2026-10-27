@@ -1,0 +1,13 @@
+---
+source: tests/serve.rs
+assertion_line: 56
+expression: listing
+---
+context: readOnly alwaysLoad
+get: readOnly
+history: readOnly
+promotion: readOnly
+push: openWorld
+scan:
+search: readOnly alwaysLoad
+write: destructive

@@ -1,0 +1,8 @@
+---
+source: tests/serve.rs
+assertion_line: 104
+expression: text
+---
+0. created caveat [ULID] "Prisma migrations fail silently" (version [VERSION])
+1. created caveat [ULID] "Prisma needs a shadow database" (version [VERSION])
+Commit: [SHA]

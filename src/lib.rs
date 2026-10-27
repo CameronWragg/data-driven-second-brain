@@ -2,8 +2,14 @@
 
 pub mod brain;
 pub mod config;
+pub mod get;
 mod git;
+pub mod id;
 mod init;
+pub mod lock;
+pub mod recollection;
+mod serve;
+pub mod write;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -52,7 +58,7 @@ pub fn run(cli: Cli) -> ExitCode {
         Command::Init { no_remote, path } => {
             return report("init", init::run(no_remote, path));
         }
-        Command::Serve => "serve",
+        Command::Serve => return report("serve", serve::run()),
         Command::Reindex => "reindex",
         Command::Eval => "eval",
         Command::Hook(Hook::Stop) => "hook stop",

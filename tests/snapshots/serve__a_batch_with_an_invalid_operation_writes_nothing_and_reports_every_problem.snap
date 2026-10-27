@@ -1,0 +1,15 @@
+---
+source: tests/serve.rs
+assertion_line: 154
+expression: text
+---
+rejected: the batch failed its checks, so nothing was written
+- operation 1 (schema): `title` is empty
+- operation 1 (schema): `summary` must be one line
+- operation 1 (schema): a caveat needs a `## Cause` section in its body
+- operation 1 (schema): a caveat needs a `## Avoidance` section in its body
+- operation 1 (schema): the `about` Link points at dep:npm:unknown, which isn't a known Entity
+- operation 2 (schema): `links` needs at least one `about` Link to an Entity
+- operation 2 (schema): the `relates-to` Link points at 01JB3K8V9Q0000000000000000, which isn't a known Recollection
+- operation 2 (schema): a Recollection can't have a `depends-on` Link; those go from a Repository
+Fix every problem above and send the whole batch again.
