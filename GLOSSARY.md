@@ -24,6 +24,10 @@ _Avoid_: Node, object, resource
 A unit of distilled knowledge about one or more Entities, such as a decision, convention or gotcha.
 _Avoid_: Note, memory, document, entry, file
 
+**Item**:
+A Recollection or an Entity: anything in the Second Brain that has an ID and a file of its own.
+_Avoid_: Record, object, file
+
 **Kind**:
 The category of a Recollection: decision, convention, caveat, architecture or how-to.
 _Avoid_: Type, category, gotcha, pitfall
