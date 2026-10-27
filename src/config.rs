@@ -185,8 +185,9 @@ impl Config {
     }
 }
 
-/// Sets `brain.path` in the configuration file, creating the file if need be
-/// and keeping everything else in it as it was.
+/// Points the configuration file at the brain folder `brain_path`, creating
+/// the file if need be and keeping everything else in it as it was. A brain
+/// at the default path removes `brain.path`, so no key means the default.
 pub fn set_brain_path(dirs: &Dirs, brain_path: &Path) -> Result<(), ConfigError> {
     let path = dirs.config_file();
     let value = brain_path
@@ -203,7 +204,19 @@ pub fn set_brain_path(dirs: &Dirs, brain_path: &Path) -> Result<(), ConfigError>
                 path: path.clone(),
                 source: source.into(),
             })?;
-    document.entry("brain").or_insert_with(toml_edit::table)["path"] = toml_edit::value(value);
+    if brain_path == dirs.default_brain_path() {
+        if let Some(brain) = document
+            .get_mut("brain")
+            .and_then(|item| item.as_table_like_mut())
+        {
+            brain.remove("path");
+            if brain.is_empty() {
+                document.remove("brain");
+            }
+        }
+    } else {
+        document.entry("brain").or_insert_with(toml_edit::table)["path"] = toml_edit::value(value);
+    }
     let write = |source| ConfigError::Write {
         path: path.clone(),
         source,

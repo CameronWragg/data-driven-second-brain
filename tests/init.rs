@@ -229,3 +229,27 @@ fn a_failed_init_empties_an_empty_folder_it_was_given() {
     assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
     assert!(!test.config_file().exists());
 }
+
+#[test]
+fn init_at_the_default_path_removes_a_brain_path_set_elsewhere() {
+    let test = TestBrain::new();
+    fs::create_dir_all(test.config_file().parent().unwrap()).unwrap();
+    let elsewhere = test.home().join("brains/old");
+    fs::write(
+        test.config_file(),
+        format!(
+            "[brain]\npath = \"{}\"\n\n[embedding]\nprovider = \"hash\"\n",
+            elsewhere.display()
+        ),
+    )
+    .unwrap();
+    let default = test.default_brain();
+
+    assert_success(&test.latens(&["init", "--no-remote", "--path", default.to_str().unwrap()]));
+
+    let text = fs::read_to_string(test.config_file()).unwrap();
+    assert!(!text.contains("path"), "{text}");
+    let config = Config::load(&test.dirs()).unwrap();
+    assert_eq!(config.brain_path, default);
+    assert_eq!(config.embedding_provider, EmbeddingProvider::Hash);
+}
