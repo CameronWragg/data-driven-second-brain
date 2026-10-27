@@ -1,7 +1,9 @@
 //! Latens holds a Second Brain and serves it to Agents over MCP.
 
 pub mod brain;
+pub mod checkout;
 pub mod config;
+pub mod entity;
 pub mod get;
 mod git;
 pub mod id;

@@ -1,0 +1,9 @@
+---
+source: tests/checkout.rs
+assertion_line: 44
+expression: text
+---
+Repository: repo:github.com/Owner/api
+Branch: main (the default branch)
+Checkout: [CHECKOUT]
+To do: nothing.

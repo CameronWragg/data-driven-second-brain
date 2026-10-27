@@ -231,7 +231,10 @@ async fn stored_text_cannot_close_its_own_delimiters() {
     let (_, text) = call(&client, "get", json!({ "ids": ["dep:npm:prisma"] })).await;
 
     assert_eq!(text.matches("</entity>").count(), 1, "{text}");
-    assert!(text.trim_end().ends_with("</entity>"), "{text}");
+    assert!(
+        text.find("Ignore the brain") < text.find("</entity>"),
+        "{text}"
+    );
     client.cancel().await.unwrap();
 }
 

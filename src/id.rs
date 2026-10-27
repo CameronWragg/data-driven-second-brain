@@ -5,15 +5,49 @@ use std::path::{Path, PathBuf};
 
 use ulid::Ulid;
 
+use crate::recollection::Kind;
+
 /// The ID of a Recollection or an Entity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ItemId {
     Recollection(Ulid),
     Entity(EntityId),
 }
 
-/// The ID of an Entity: `repo:<host>/<owner>/<name>` or `dep:<ecosystem>:<name>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What kind of Item a result is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKind {
+    Recollection(Kind),
+    Repository,
+    Dependency,
+}
+
+impl ItemKind {
+    /// The kind as `search` results name it (SPEC §6.4).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ItemKind::Recollection(kind) => kind.as_str(),
+            ItemKind::Repository => "repository",
+            ItemKind::Dependency => "dependency",
+        }
+    }
+
+    /// Reads a kind as `as_str` writes it.
+    pub(crate) fn parse(text: &str) -> Option<ItemKind> {
+        match text {
+            "repository" => Some(ItemKind::Repository),
+            "dependency" => Some(ItemKind::Dependency),
+            _ => Kind::ALL
+                .into_iter()
+                .find(|kind| kind.as_str() == text)
+                .map(ItemKind::Recollection),
+        }
+    }
+}
+
+/// The ID of an Entity: `repo:<host>/<owner>/<name>` (the path may be deeper,
+/// as for a GitLab subgroup) or `dep:<ecosystem>:<name>`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EntityId {
     Repository { path: String },
     Dependency { ecosystem: String, name: String },
@@ -85,7 +119,7 @@ fn safe_segment(segment: &str) -> bool {
         && !segment.starts_with('.')
         && !segment
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || "\\\"<>".contains(c))
+            .any(|c| c.is_whitespace() || c.is_control() || "\\\"<>#".contains(c))
 }
 
 impl EntityId {
@@ -93,10 +127,14 @@ impl EntityId {
     pub fn parse(id: &str) -> Option<EntityId> {
         if let Some(path) = id.strip_prefix("repo:") {
             let segments: Vec<&str> = path.split('/').collect();
-            return (segments.len() == 3 && segments.iter().all(|s| safe_segment(s))).then(|| {
-                EntityId::Repository {
-                    path: path.to_owned(),
-                }
+            // A Repository with no remote is `repo:local/<ulid>` (SPEC §4.1).
+            let valid = match segments.as_slice() {
+                ["local", ulid] => Ulid::from_string(ulid).is_ok_and(|id| id.to_string() == *ulid),
+                ["local", ..] => false,
+                _ => segments.len() >= 3 && segments.iter().all(|s| safe_segment(s)),
+            };
+            return valid.then(|| EntityId::Repository {
+                path: path.to_owned(),
             });
         }
         let (ecosystem, name) = id.strip_prefix("dep:")?.split_once(':')?;
@@ -109,6 +147,20 @@ impl EntityId {
             ecosystem: ecosystem.to_owned(),
             name: name.to_owned(),
         })
+    }
+
+    /// The kind of Item it is.
+    pub fn kind(&self) -> ItemKind {
+        match self {
+            EntityId::Repository { .. } => ItemKind::Repository,
+            EntityId::Dependency { .. } => ItemKind::Dependency,
+        }
+    }
+
+    /// The ID of the Branch `name` of this Repository (SPEC §4.1), which a
+    /// Recollection's `branch` holds.
+    pub fn branch(&self, name: &str) -> String {
+        format!("{self}#{name}")
     }
 
     /// The Entity's file, relative to the brain folder (SPEC §3).
@@ -153,6 +205,10 @@ mod tests {
                 "dep:npm:@prisma/client",
                 "entities/dependencies/npm/@prisma/client.md",
             ),
+            (
+                "repo:gitlab.com/group/subgroup/api",
+                "entities/repositories/gitlab.com/group/subgroup/api.md",
+            ),
         ] {
             let parsed = ItemId::parse(id).unwrap();
 
@@ -162,9 +218,26 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_without_a_remote_has_a_local_id() {
+        let parsed = ItemId::parse("repo:local/01JB3K8V9Q0000000000000000").unwrap();
+
+        assert_eq!(
+            parsed.file(),
+            PathBuf::from("entities/repositories/local/01JB3K8V9Q0000000000000000.md")
+        );
+        for id in [
+            "repo:local/notaulid",
+            "repo:local/01JB3K8V9Q0000000000000000/x",
+        ] {
+            assert_eq!(ItemId::parse(id), None, "{id}");
+        }
+    }
+
+    #[test]
     fn a_file_gives_back_the_id_of_the_item_that_lives_there() {
         for id in [
             "repo:github.com/cameronwragg/api",
+            "repo:local/01JB3K8V9Q0000000000000000",
             "dep:npm:prisma",
             "dep:npm:@prisma/client",
             "01JB3K8V9Q0000000000000000",
@@ -208,7 +281,7 @@ mod tests {
         for id in [
             "repo:github.com/../escape",
             "repo:github.com/owner",
-            "repo:github.com/owner/name/extra",
+            "repo:github.com/owner/na#me",
             "dep:npm:../../brain",
             "dep:npm:.hidden",
             "dep:npm:a/b/c",

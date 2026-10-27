@@ -1,0 +1,14 @@
+---
+source: tests/checkout.rs
+assertion_line: 373
+expression: text
+---
+rejected: the batch failed its checks, so nothing was written
+- operation 0 (schema): dep:npm:prisma already exists; change it with `update_entity`
+- operation 1 (schema): repo:local/01JB3K8V9Q0000000000000000 is a local Repository ID, which only the server gives, to a Checkout with no remote
+- operation 2 (schema): `default_branch` is filled in by the server; leave it out
+- operation 2 (schema): `name` is empty
+- operation 2 (schema): only a Dependency has `docs`
+- operation 3 (schema): not an id isn't an Entity ID; give `repo:<host>/<owner>/<name>` or `dep:<ecosystem>:<name>`
+- operation 4 (schema): no Entity has the ID dep:npm:nowhere
+Fix every problem above and send the whole batch again.

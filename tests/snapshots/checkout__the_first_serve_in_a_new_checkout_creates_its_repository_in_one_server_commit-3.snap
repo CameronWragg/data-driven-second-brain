@@ -1,0 +1,15 @@
+---
+source: tests/checkout.rs
+assertion_line: 48
+expression: "fs::read_to_string(file).unwrap()"
+---
+---
+id: repo:github.com/Owner/api
+name: api
+default_branch: main
+forked_from: null
+components: []
+branches: {}
+links: []
+manifest_hashes: {}
+---

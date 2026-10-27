@@ -1,0 +1,11 @@
+---
+source: tests/checkout.rs
+assertion_line: 304
+expression: message
+---
+Change 2 Items
+
+Recollection: [ULID]
+Dependency: dep:npm:zod
+Action: create_entity, create
+Author: agent

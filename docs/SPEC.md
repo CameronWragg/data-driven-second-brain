@@ -71,16 +71,16 @@ By default the folder is at `$XDG_DATA_HOME/latens`; the owner can move it with 
 | Thing | ID form | Example |
 |---|---|---|
 | Recollection | ULID | `01JB3K…` |
-| Repository | `repo:<host>/<owner>/<name>` | `repo:github.com/cameronwragg/api` |
+| Repository | `repo:<host>/<owner>/<name>`, or a deeper path such as a GitLab subgroup's | `repo:github.com/cameronwragg/api` |
 | Dependency | `dep:<ecosystem>:<name>` | `dep:npm:prisma` |
 | Branch | `<repository id>#<branch>` | `repo:github.com/cameronwragg/api#feature/x` |
 
-**Repository identity** is the normalised remote URL of `origin`:
+**Repository identity** is the normalised remote URL of `origin`, after git's `insteadOf` rewrites:
 - lower-case the host
 - remove `.git` from the end
 - convert SSH and HTTPS forms to the same `host/owner/name` form
 
-A Repository with no remote gets `repo:local/<ulid>`, which is recorded in the Checkout (§4.3).
+A Repository with no remote, or whose `origin` isn't hosted (a path on this machine), gets `repo:local/<ulid>`, which is recorded in the Checkout (§4.3); `context` says why.
 
 ### 4.2 Entity files
 
@@ -114,7 +114,11 @@ links: []
 
 ### 4.3 Checkouts
 
-Checkouts are specific to one machine and are never committed. The index records each Checkout's path and the Repository it belongs to. A Repository with no remote is recognised again through a `.git/latens-id` file inside its Checkout.
+Checkouts are specific to one machine and are never committed. The index records each Checkout's path and the Repository it belongs to whenever `serve` detects one; a rebuild drops them, so the index stays derived from files ([ADR-0001](./adr/0001-files-as-truth-sqlite-as-index.md)). A Repository with no remote is recognised again through a `.git/latens-id` file inside its Checkout's git folder, created only if missing so that two `serve`s starting together agree on it.
+
+The **default branch** is `origin/HEAD`, else a local `main` or `master`, else the only local Branch. The Repository Entity's `default_branch` wins once it is set. If none of these settles it, `default_branch` stays `null`, `context` asks the owner to set it, and every Recollection written meanwhile records its Branch; the next `serve` whose Checkout knows the default branch records it in a server commit.
+
+The **current Branch** is the one checked out or, during a rebase, the one being rebased. On any other detached HEAD there is none, and `write` rejects new Recollections until a Branch is checked out.
 
 ### 4.4 Recollections
 
@@ -127,7 +131,7 @@ title: Prisma migrations fail silently without a shadow database
 summary: `prisma migrate dev` exits 0 but applies nothing when SHADOW_DATABASE_URL is unset.
 state: active                      # active | abandoned
 abandoned_at: null
-branch: null                       # null = the Repository's default branch
+branch: null                       # null = the default branch; else a Branch ID (§4.1)
 applies_to: { "dep:npm:prisma": "<5" }   # optional version ranges
 tags: [migrations]
 links:
@@ -190,7 +194,7 @@ All changes go through the `write` tool as a **batch** of operations. A batch is
 | `update_entity` | `id`, `version`; any of `name`, `description`, `docs` | All other Entity fields belong to the server and scanner |
 | `set_branch_status` | `branch`, `outcome: merged \| closed`, optional `into` (defaults to the default branch) | Settles a Branch by hand (§9.1) |
 
-**Fields the server fills in.** Agents never send `id` (on `create`), `created`, `updated`, `state`, `abandoned_at`, `branch`, or an Anchor's `commit` and `hash`. `branch` is the current Branch of the detected Checkout; only an `update` made for a Promotion (§9.3) may re-target it. An Anchor takes `path`, `lines` and an optional `repository` (default: the current Repository); the server computes `commit` and `hash` from the Checkout. If the anchored lines have uncommitted changes, the Anchor records the working-tree text, the commit is HEAD, and it is marked `uncommitted: true` (§8).
+**Fields the server fills in.** Agents never send `id` (on `create`), `created`, `updated`, `state`, `abandoned_at`, `branch`, or an Anchor's `commit` and `hash`. `branch` is the Branch ID of the detected Checkout's current Branch (§4.3), or `null` on its default branch; only an `update` made for a Promotion (§9.3) may re-target it. An Anchor takes `path`, `lines` and an optional `repository` (default: the current Repository); the server computes `commit` and `hash` from the Checkout. If the anchored lines have uncommitted changes, the Anchor records the working-tree text, the commit is HEAD, and it is marked `uncommitted: true` (§8).
 
 **References within a batch.** A `create` or `create_entity` may carry a local `ref` (e.g. `"a"`), and later operations in the same batch may name it as `ref:a`. The result maps each ref to its new ID.
 
@@ -297,10 +301,10 @@ A second built-in provider, `hash`, needs no model: it feature-hashes the prepro
 
 1. **Scope.** By default the search covers:
    - the current Repository
-   - Entities Linked to it **directly** (one step away), and Recollections about them
+   - Entities its own Links point at **directly** (one step away), and Recollections about them
    - on Branches, the current Branch plus the default branch
 
-   Recollections from other Branches are included only if the caller asks (`branches`: a list of names, or `"all"`), and are labelled with their Branch. `scope` is `"current"` (the default), `"all"`, or a Repository ID. With no detected Checkout, `"current"` behaves as `"all"`, and the results say so.
+   Recollections from other Branches are included only if the caller asks (`branches`: a list of names, or `"all"`), and are labelled with their Branch ID. Names are Branches of the Repository in scope; with `scope: "all"` they match that name in every Repository. `scope` is `"current"` (the default), `"all"`, or a Repository ID. With no detected Checkout, `"current"` behaves as `"all"`, and the results say so.
 2. **Filters:** Kind, Entity, tags, and whether to include abandoned Recollections.
 3. **Ranking:** FTS5 and vector results are merged with reciprocal rank fusion.
 4. **Results:** Recollections and Entities, ranked, each with `id`, `kind` (`repository` or `dependency` for Entities), `title`, `summary`, `version`, and `branch` and staleness only when they apply. Scores are not returned; the rank carries the order. The full body comes from `get`.

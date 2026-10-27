@@ -1,0 +1,9 @@
+---
+source: tests/checkout.rs
+assertion_line: 500
+expression: "text.replace(&home, \"[HOME]\")"
+---
+Repository: repo:github.com/Owner/api
+Branch: feature/x; the default branch is unknown, so Recollections written here belong to feature/x
+Checkout: [CHECKOUT]
+To do: ask the owner to set `default_branch` in [HOME]/.local/share/latens/entities/repositories/github.com/Owner/api.md.

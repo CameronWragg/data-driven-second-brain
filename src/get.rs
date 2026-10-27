@@ -5,16 +5,31 @@ use std::path::PathBuf;
 
 use crate::brain::Brain;
 use crate::id::ItemId;
+use crate::index::{Hit, Index};
 use crate::recollection;
 
+/// How many Recollections about an Entity `get` lists (SPEC §14.4).
+const ABOUT_LIMIT: usize = 10;
+
 /// A Recollection or Entity found by its ID, exactly as it is on disk. An
-/// Entity's linked Recollections and resolved `docs` (SPEC §14.4) wait for
-/// the index.
+/// Entity's resolved `docs` (SPEC §14.4) wait for the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub id: ItemId,
     pub version: String,
     pub text: String,
+    /// For an Entity, the Recollections about it; `None` for a Recollection,
+    /// or if the index couldn't be read.
+    pub about: Option<About>,
+}
+
+/// The newest active Recollections about an Entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct About {
+    /// At most `ABOUT_LIMIT`.
+    pub recollections: Vec<Hit>,
+    /// How many there are in all.
+    pub total: usize,
 }
 
 /// What `get` found, in request order.
@@ -32,9 +47,10 @@ pub struct GetError {
     source: io::Error,
 }
 
-/// Reads each of `ids`. A hand-edited file is returned as it is, even one
-/// that no longer parses.
-pub fn get(brain: &Brain, ids: &[String]) -> Result<Found, GetError> {
+/// Reads each of `ids`, listing what `index`, if there is one, holds about
+/// each Entity. A hand-edited file is returned as it is, even one that no
+/// longer parses.
+pub fn get(brain: &Brain, index: Option<&Index>, ids: &[String]) -> Result<Found, GetError> {
     let mut found = Found {
         items: Vec::new(),
         not_found: Vec::new(),
@@ -46,11 +62,24 @@ pub fn get(brain: &Brain, ids: &[String]) -> Result<Found, GetError> {
         };
         let path = brain.root().join(id.file());
         match std::fs::read_to_string(&path) {
-            Ok(text) => found.items.push(Item {
-                id,
-                version: recollection::version(&text),
-                text,
-            }),
+            Ok(text) => {
+                let about = match (&id, index) {
+                    (ItemId::Entity(entity), Some(index)) => index
+                        .about(entity, ABOUT_LIMIT)
+                        .ok()
+                        .map(|(recollections, total)| About {
+                            recollections,
+                            total,
+                        }),
+                    _ => None,
+                };
+                found.items.push(Item {
+                    version: recollection::version(&text),
+                    id,
+                    text,
+                    about,
+                })
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 found.not_found.push(requested.clone())
             }

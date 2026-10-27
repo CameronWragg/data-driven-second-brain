@@ -1,0 +1,7 @@
+---
+source: tests/checkout.rs
+assertion_line: 277
+expression: text
+---
+No Checkout is detected, so `current` acts as `all`: this searched every Repository.
+Nothing matched. Try other words, or fewer filters.

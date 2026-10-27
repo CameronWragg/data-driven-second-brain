@@ -1,0 +1,12 @@
+---
+source: tests/checkout.rs
+assertion_line: 181
+expression: message
+---
+Create caveat: Shadow on a branch
+
+Recollection: [ULID]
+Repository: repo:github.com/Owner/api
+Branch: feature/x
+Action: create
+Author: agent
