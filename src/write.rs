@@ -72,7 +72,8 @@ pub struct Create {
 pub struct Update {
     /// The Recollection's ID.
     pub id: String,
-    /// The `version` you last saw, from `get`, `search` or `write`.
+    /// The `version` you last saw, from `get`, `search` or `write`; the same
+    /// one even if an earlier operation in this batch changes the Recollection.
     pub version: String,
     pub kind: Option<Kind>,
     pub title: Option<String>,
@@ -93,7 +94,8 @@ pub struct Update {
 pub struct Supersede {
     /// The ID of the Recollection to replace.
     pub id: String,
-    /// The `version` you last saw, from `get`, `search` or `write`.
+    /// The `version` you last saw, from `get`, `search` or `write`; the same
+    /// one even if an earlier operation in this batch changes the Recollection.
     pub version: String,
     /// The new Recollection, with the same fields as `create`.
     pub replacement: Create,
@@ -108,7 +110,8 @@ pub struct Supersede {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct Delete {
     pub id: String,
-    /// The `version` you last saw, from `get`, `search` or `write`.
+    /// The `version` you last saw, from `get`, `search` or `write`; the same
+    /// one even if an earlier operation in this batch changes the Recollection.
     pub version: String,
     /// Any other field, reported as a problem rather than refused outright,
     /// so a rejection lists it with every other problem.
@@ -127,7 +130,8 @@ pub struct LinkChange {
     /// The ID of the Entity or Recollection the Link points at, or
     /// `ref:<name>` for one an earlier operation in the batch creates.
     pub to: String,
-    /// The `version` you last saw of the Recollection the Link starts from.
+    /// The `version` you last saw of the Recollection the Link starts from;
+    /// the same one even if an earlier operation in this batch changes it.
     pub from_version: String,
     /// The version a `depends-on` Link carries.
     pub version: Option<String>,
@@ -218,50 +222,40 @@ pub struct Written {
 /// the replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    pub action: Action,
+    pub change: Change,
     pub id: Ulid,
     pub kind: Kind,
     pub title: String,
-    /// For a create or supersede, the `ref` the new Recollection was given.
-    pub reference: Option<String>,
-    /// For a supersede, the Recollection it replaced.
-    pub superseded: Option<Ulid>,
-    /// For a link or unlink, the Link.
-    pub link: Option<Link>,
 }
 
-/// The operation an outcome came from, as named in the `Action:` trailer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Create,
-    Update,
-    Supersede,
-    Delete,
-    Link,
-    Unlink,
+/// What an operation changed, with what only that kind of change has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// With the `ref` the new Recollection was given, if any.
+    Created {
+        reference: Option<String>,
+    },
+    Updated,
+    /// With the Recollection replaced, and the replacement's `ref`.
+    Superseded {
+        old: Ulid,
+        reference: Option<String>,
+    },
+    Deleted,
+    Linked(Link),
+    Unlinked(Link),
 }
 
-impl Action {
-    pub fn as_str(self) -> &'static str {
+impl Change {
+    /// The operation it came from, as the `Action:` trailer names it.
+    pub fn action(&self) -> &'static str {
         match self {
-            Action::Create => "create",
-            Action::Update => "update",
-            Action::Supersede => "supersede",
-            Action::Delete => "delete",
-            Action::Link => "link",
-            Action::Unlink => "unlink",
-        }
-    }
-
-    /// The verb for a commit subject.
-    fn verb(self) -> &'static str {
-        match self {
-            Action::Create => "Create",
-            Action::Update => "Update",
-            Action::Supersede => "Supersede",
-            Action::Delete => "Delete",
-            Action::Link => "Link",
-            Action::Unlink => "Unlink",
+            Change::Created { .. } => "create",
+            Change::Updated => "update",
+            Change::Superseded { .. } => "supersede",
+            Change::Deleted => "delete",
+            Change::Linked(_) => "link",
+            Change::Unlinked(_) => "unlink",
         }
     }
 }
@@ -374,8 +368,7 @@ impl<'a> Batch<'a> {
         self.check_unexpected("create", &create.unexpected, &SERVER_FILLED);
         let reference = create.reference.clone();
         let (id, recollection) = self.new_recollection(create, Vec::new());
-        self.outcome(Action::Create, id, &recollection, None);
-        self.with_reference(reference);
+        self.outcome(Change::Created { reference }, id, &recollection);
         self.staged.insert(id, Some(recollection));
         Ok(())
     }
@@ -410,8 +403,7 @@ impl<'a> Batch<'a> {
             return Ok(());
         };
         if self.problems.len() == before {
-            self.outcome(Action::Supersede, id, &recollection, Some(old));
-            self.with_reference(reference);
+            self.outcome(Change::Superseded { old, reference }, id, &recollection);
             self.staged.insert(old, None);
         }
         Ok(())
@@ -427,7 +419,7 @@ impl<'a> Batch<'a> {
         if let Some((id, recollection)) = target
             && self.problems.len() == before
         {
-            self.outcome(Action::Delete, id, &recollection, None);
+            self.outcome(Change::Deleted, id, &recollection);
             self.staged.insert(id, None);
         }
         Ok(())
@@ -452,7 +444,7 @@ impl<'a> Batch<'a> {
         }
         if self.problems.len() == before {
             recollection.front_matter.links.push(link.clone());
-            self.changed_link(Action::Link, id, recollection, link);
+            self.changed_link(Change::Linked(link), id, recollection);
         }
         Ok(())
     }
@@ -484,7 +476,7 @@ impl<'a> Batch<'a> {
             ));
         }
         if self.problems.len() == before {
-            self.changed_link(Action::Unlink, id, recollection, link);
+            self.changed_link(Change::Unlinked(link), id, recollection);
         }
         Ok(())
     }
@@ -532,18 +524,9 @@ impl<'a> Batch<'a> {
     }
 
     /// Stages a Recollection whose Links an operation changed.
-    fn changed_link(
-        &mut self,
-        action: Action,
-        id: Ulid,
-        mut recollection: Recollection,
-        link: Link,
-    ) {
+    fn changed_link(&mut self, change: Change, id: Ulid, mut recollection: Recollection) {
         recollection.front_matter.updated = self.timestamp.clone();
-        self.outcome(action, id, &recollection, None);
-        if let Some(outcome) = self.outcomes.last_mut() {
-            outcome.link = Some(link);
-        }
+        self.outcome(change, id, &recollection);
         self.staged.insert(id, Some(recollection));
     }
 
@@ -647,34 +630,18 @@ impl<'a> Batch<'a> {
             recollection.body = body;
         }
         recollection.front_matter.updated = self.timestamp.clone();
-        self.outcome(Action::Update, id, &recollection, None);
+        self.outcome(Change::Updated, id, &recollection);
         self.staged.insert(id, Some(recollection));
         Ok(())
     }
 
-    /// Notes the `ref` of the new Recollection in the last outcome.
-    fn with_reference(&mut self, reference: Option<String>) {
-        if let Some(outcome) = self.outcomes.last_mut() {
-            outcome.reference = reference;
-        }
-    }
-
     /// Records what an operation did to Recollection `id`.
-    fn outcome(
-        &mut self,
-        action: Action,
-        id: Ulid,
-        recollection: &Recollection,
-        superseded: Option<Ulid>,
-    ) {
+    fn outcome(&mut self, change: Change, id: Ulid, recollection: &Recollection) {
         self.outcomes.push(Outcome {
-            action,
+            change,
             id,
             kind: recollection.front_matter.kind,
             title: recollection.front_matter.title.clone(),
-            reference: None,
-            superseded,
-            link: None,
         });
     }
 
@@ -920,29 +887,43 @@ fn entity_exists(root: &Path, id: &str) -> bool {
 /// The commit message for a batch: a generated subject, then trailers (SPEC §5.3).
 fn message(outcomes: &[Outcome]) -> String {
     let mut ids: Vec<Ulid> = Vec::new();
-    let mut actions: Vec<Action> = Vec::new();
+    let mut actions: Vec<&str> = Vec::new();
     for outcome in outcomes {
-        for id in outcome.superseded.iter().chain([&outcome.id]) {
-            if !ids.contains(id) {
-                ids.push(*id);
+        let old = match outcome.change {
+            Change::Superseded { old, .. } => Some(old),
+            _ => None,
+        };
+        for id in old.into_iter().chain([outcome.id]) {
+            if !ids.contains(&id) {
+                ids.push(id);
             }
         }
-        if !actions.contains(&outcome.action) {
-            actions.push(outcome.action);
+        if !actions.contains(&outcome.change.action()) {
+            actions.push(outcome.change.action());
         }
     }
     let subject = match (outcomes, ids.len(), actions.as_slice()) {
-        ([one], _, _) => format!("{} {}: {}", one.action.verb(), one.kind.as_str(), one.title),
-        (_, count, [action]) => format!("{} {count} Recollections", action.verb()),
+        ([one], _, [action]) => {
+            format!("{} {}: {}", verb(action), one.kind.as_str(), one.title)
+        }
+        (_, count, [action]) => format!("{} {count} Recollections", verb(action)),
         (_, count, _) => format!("Change {count} Recollections"),
     };
     let mut message = format!("{subject}\n\n");
     for id in &ids {
         message.push_str(&format!("Recollection: {id}\n"));
     }
-    let actions: Vec<&str> = actions.iter().map(|action| action.as_str()).collect();
     message.push_str(&format!("Action: {}\nAuthor: agent\n", actions.join(", ")));
     message
+}
+
+/// An action as the verb that starts a commit subject.
+fn verb(action: &str) -> String {
+    let mut chars = action.chars();
+    chars
+        .next()
+        .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+        .unwrap_or_default()
 }
 
 /// One file a batch changes, relative to the brain folder: its text before
