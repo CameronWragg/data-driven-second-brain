@@ -109,13 +109,46 @@ impl TestBrain {
 
     /// Starts `latens serve` and connects rmcp's client to it over stdio.
     pub async fn serve(&self) -> RunningService<RoleClient, ()> {
+        self.serve_with(self.command(env!("CARGO_BIN_EXE_latens")))
+            .await
+    }
+
+    /// Starts `latens serve` with `dir` as its working directory.
+    pub async fn serve_in(&self, dir: &Path) -> RunningService<RoleClient, ()> {
         let mut command = self.command(env!("CARGO_BIN_EXE_latens"));
+        command.current_dir(dir);
+        self.serve_with(command).await
+    }
+
+    /// Starts `latens serve` from `$HOME` with `CLAUDE_PROJECT_DIR` set to `dir`.
+    pub async fn serve_for_project(&self, dir: &Path) -> RunningService<RoleClient, ()> {
+        let mut command = self.command(env!("CARGO_BIN_EXE_latens"));
+        command.env("CLAUDE_PROJECT_DIR", dir);
+        self.serve_with(command).await
+    }
+
+    async fn serve_with(&self, mut command: Command) -> RunningService<RoleClient, ()> {
         command.arg("serve");
         let transport = TokioChildProcess::new(tokio::process::Command::from(command))
             .expect("latens serve starts");
         ().serve(transport)
             .await
             .expect("the MCP handshake succeeds")
+    }
+
+    /// Makes a Checkout named `name` outside the brain, with one commit on
+    /// `main` and `remote`, if any, as its `origin`.
+    pub fn checkout(&self, name: &str, remote: Option<&str>) -> PathBuf {
+        let dir = self.dir.path().join("work").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        self.git(&dir, &["init", "--quiet", "--initial-branch", "main"]);
+        fs::write(dir.join("README.md"), format!("# {name}\n")).unwrap();
+        self.git(&dir, &["add", "README.md"]);
+        self.git(&dir, &["commit", "--quiet", "--message", "Start"]);
+        if let Some(remote) = remote {
+            self.git(&dir, &["remote", "add", "origin", remote]);
+        }
+        dir
     }
 
     /// Runs `git` in `dir` and returns its stdout, failing the test if it fails.

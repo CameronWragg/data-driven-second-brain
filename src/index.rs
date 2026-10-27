@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde::Deserialize;
 
 use crate::brain::Brain;
+use crate::entity::Entity;
 use crate::id::{EntityId, ItemId};
 use crate::identifiers;
 use crate::lock::WriteLock;
@@ -31,6 +31,20 @@ pub struct Query {
     pub include_abandoned: bool,
     /// The most results to give.
     pub limit: usize,
+    /// Only Items in this Repository's scope (SPEC §6.4): the Repository, the
+    /// Entities Linked to it directly either way, and Recollections about any
+    /// of them. Every Repository's if `None`.
+    pub repository: Option<String>,
+    /// The Branches whose Recollections are found besides the default
+    /// branch's, which always are.
+    pub branches: Branches,
+}
+
+/// Which Branches a search finds Recollections on besides the default branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Branches {
+    All,
+    Only(Vec<String>),
 }
 
 /// One search result, best first.
@@ -76,7 +90,7 @@ pub enum IndexError {
 
 /// The index schema this binary builds. Any change to `SCHEMA` bumps it: an
 /// index built at another version is rebuilt, never migrated.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -97,6 +111,8 @@ CREATE TABLE links (source TEXT NOT NULL, type TEXT NOT NULL, target TEXT NOT NU
 CREATE INDEX links_by_source ON links (source);
 CREATE INDEX links_by_target ON links (target);
 CREATE VIRTUAL TABLE text USING fts5 (title, body, split);
+CREATE TABLE checkouts (path TEXT PRIMARY KEY, repository TEXT NOT NULL) STRICT;
+CREATE INDEX checkouts_by_repository ON checkouts (repository);
 ";
 
 /// The index's database file, relative to the brain folder.
@@ -185,8 +201,18 @@ impl Index {
         let kinds = list(query.kinds.iter().map(|kind| kind.as_str()).collect());
         let entities = list(query.entities.iter().map(String::as_str).collect());
         let tags = list(query.tags.iter().map(String::as_str).collect());
+        let (all_branches, branches) = match &query.branches {
+            Branches::All => (true, None),
+            Branches::Only(names) => (false, list(names.iter().map(String::as_str).collect())),
+        };
         let mut statement = self.connection.prepare_cached(
-            "SELECT items.id, items.kind, items.title, items.summary, files.hash, items.branch
+            "WITH scope (id) AS (
+                 SELECT ?7
+                 UNION SELECT target FROM links
+                 WHERE source = ?7 AND (target LIKE 'repo:%' OR target LIKE 'dep:%')
+                 UNION SELECT source FROM links
+                 WHERE target = ?7 AND (source LIKE 'repo:%' OR source LIKE 'dep:%'))
+             SELECT items.id, items.kind, items.title, items.summary, files.hash, items.branch
              FROM text
              JOIN items ON items.row = text.rowid
              JOIN files ON files.path = items.path
@@ -200,6 +226,12 @@ impl Index {
                AND (?5 IS NULL OR EXISTS (
                    SELECT 1 FROM tags
                    WHERE tags.id = items.id AND tags.tag IN (SELECT value FROM json_each(?5))))
+               AND (?7 IS NULL OR items.id IN scope OR EXISTS (
+                   SELECT 1 FROM links
+                   WHERE links.source = items.id AND links.type = 'about'
+                     AND links.target IN scope))
+               AND (?8 OR items.branch IS NULL
+                    OR items.branch IN (SELECT value FROM json_each(?9)))
              ORDER BY bm25(text, 3.0, 1.0, 1.0), items.id
              LIMIT ?6",
         )?;
@@ -211,22 +243,62 @@ impl Index {
                     kinds,
                     entities,
                     tags,
-                    query.limit as i64
+                    query.limit as i64,
+                    query.repository,
+                    all_branches,
+                    branches
                 ],
-                |row| {
-                    let kind: String = row.get(1)?;
-                    Ok(Hit {
-                        id: row.get(0)?,
-                        kind: ItemKind::parse(&kind).expect("the index stores only known kinds"),
-                        title: row.get(2)?,
-                        summary: row.get(3)?,
-                        version: row.get(4)?,
-                        branch: row.get(5)?,
-                    })
-                },
+                hit,
             )?
             .collect::<Result<_, _>>()?;
         Ok(hits)
+    }
+
+    /// The active Recollections with an `about` Link to `entity`, newest
+    /// first, at most `limit` of them, and how many there are in all.
+    pub fn about(&self, entity: &str, limit: usize) -> Result<(Vec<Hit>, usize), IndexError> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT items.id, items.kind, items.title, items.summary, files.hash, items.branch,
+                    count(*) OVER ()
+             FROM links
+             JOIN items ON items.id = links.source
+             JOIN files ON files.path = items.path
+             WHERE links.target = ?1 AND links.type = 'about' AND items.state = 'active'
+             ORDER BY items.id DESC
+             LIMIT ?2",
+        )?;
+        let mut total = 0;
+        let hits = statement
+            .query_map(params![entity, limit as i64], |row| {
+                total = row.get::<_, i64>(6)? as usize;
+                hit(row)
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok((hits, total))
+    }
+
+    /// Records that a Checkout of `repository` is at `path` on this machine
+    /// (SPEC §4.3).
+    pub fn record_checkout(&mut self, path: &Path, repository: &str) -> Result<(), IndexError> {
+        let transaction = self.write()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO checkouts (path, repository) VALUES (?1, ?2)",
+            [&path.to_string_lossy(), repository],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Where `repository` is checked out on this machine.
+    pub fn checkouts(&self, repository: &str) -> Result<Vec<PathBuf>, IndexError> {
+        let mut statement = self
+            .connection
+            .prepare_cached("SELECT path FROM checkouts WHERE repository = ?1 ORDER BY path")?;
+        let paths = statement
+            .query_map([repository], |row| row.get::<_, String>(0))?
+            .map(|path| path.map(PathBuf::from))
+            .collect::<Result<_, _>>()?;
+        Ok(paths)
     }
 
     /// Starts a write, waiting for any other connection's (SPEC §11).
@@ -235,6 +307,20 @@ impl Index {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?)
     }
+}
+
+/// A result from a row whose first six columns are an Item's ID, kind,
+/// title, summary, version and branch.
+fn hit(row: &rusqlite::Row) -> rusqlite::Result<Hit> {
+    let kind: String = row.get(1)?;
+    Ok(Hit {
+        id: row.get(0)?,
+        kind: ItemKind::parse(&kind).expect("the index stores only known kinds"),
+        title: row.get(2)?,
+        summary: row.get(3)?,
+        version: row.get(4)?,
+        branch: row.get(5)?,
+    })
 }
 
 /// Index changes not yet visible to other connections.
@@ -301,8 +387,17 @@ fn index_files(
     rebuild: bool,
 ) -> Result<Refreshed, IndexError> {
     if rebuild {
+        // Checkouts belong to this machine, not the files, so they can't be
+        // rebuilt from them and are kept instead.
+        let checkouts = recorded_checkouts(transaction).unwrap_or_default();
         drop_tables(transaction)?;
         transaction.execute_batch(SCHEMA)?;
+        for (path, repository) in checkouts {
+            transaction.execute(
+                "INSERT INTO checkouts (path, repository) VALUES (?1, ?2)",
+                [path, repository],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1), ('brain_format', ?2)",
             params![SCHEMA_VERSION.to_string(), brain.format().to_string()],
@@ -330,6 +425,16 @@ fn index_files(
         refreshed.removed.push(path.into());
     }
     Ok(refreshed)
+}
+
+/// Every Checkout the index records, as `(path, repository)`; an error if an
+/// older schema has no such table.
+fn recorded_checkouts(transaction: &Transaction) -> Result<Vec<(String, String)>, IndexError> {
+    let checkouts = transaction
+        .prepare("SELECT path, repository FROM checkouts")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(checkouts)
 }
 
 /// Drops every table in the database, whatever schema version made it.
@@ -460,20 +565,8 @@ struct Indexed {
     text: String,
 }
 
-/// An Entity file's front-matter, as far as the index needs it. Unlike a
-/// Recollection's it is read leniently, since nothing yet parses Entity files
-/// whole.
-#[derive(Debug, Deserialize)]
-struct EntityFrontMatter {
-    name: String,
-    #[serde(default)]
-    links: Vec<IndexedLink>,
-}
-
 /// A Link from either kind of Item, without the fields only some carry.
-#[derive(Debug, Deserialize)]
 struct IndexedLink {
-    #[serde(rename = "type")]
     link_type: LinkType,
     to: String,
 }
@@ -509,8 +602,8 @@ impl Indexed {
                 })
             }
             ItemId::Entity(entity) => {
-                let (yaml, body) = recollection::split_front_matter(text)?;
-                let front_matter: EntityFrontMatter = serde_saphyr::from_str(yaml).ok()?;
+                let parsed = Entity::parse(entity, text).ok()?;
+                let body = parsed.description.as_str();
                 let first_line = body.lines().map(str::trim).find(|line| !line.is_empty());
                 let mut summary: String = first_line.unwrap_or_default().to_owned();
                 if summary.chars().count() > ENTITY_SUMMARY {
@@ -522,12 +615,19 @@ impl Indexed {
                         EntityId::Repository { .. } => ItemKind::Repository,
                         EntityId::Dependency { .. } => ItemKind::Dependency,
                     },
-                    title: front_matter.name,
+                    title: parsed.name().to_owned(),
                     summary,
                     state: State::Active,
                     branch: None,
                     tags: Vec::new(),
-                    links: front_matter.links,
+                    links: parsed
+                        .links()
+                        .iter()
+                        .map(|link| IndexedLink {
+                            link_type: link.link_type,
+                            to: link.to.clone(),
+                        })
+                        .collect(),
                     text: body.to_owned(),
                 })
             }
@@ -633,7 +733,120 @@ updated: 2026-10-23T10:00:00Z
             tags: Vec::new(),
             include_abandoned: false,
             limit: 10,
+            repository: None,
+            branches: Branches::All,
         }
+    }
+
+    /// A Repository Entity file for `id`, with `links` to other Entities.
+    fn repository(id: &str, links: &[&str]) -> String {
+        let id = EntityId::parse(id).unwrap();
+        let mut entity = crate::entity::Entity::new(&id, "repository", "A repository.");
+        if let crate::entity::Fields::Repository(fields) = &mut entity.fields {
+            fields.links = links
+                .iter()
+                .map(|to| crate::entity::EntityLink {
+                    link_type: LinkType::DependsOn,
+                    to: (*to).into(),
+                    version: None,
+                    by: None,
+                })
+                .collect();
+        }
+        entity.render()
+    }
+
+    /// A caveat with ID `id` about `about`, on `branch`, mentioning `shadow`.
+    fn caveat_about(test: &TestBrain, id: &str, about: &str, branch: Option<&str>) {
+        let branch = branch.map_or("null".to_owned(), |branch| format!("'{branch}'"));
+        test.put(
+            &format!("recollections/{id}.md"),
+            &caveat("The shadow database is missing.")
+                .replace(CAVEAT_ID, id)
+                .replace("dep:npm:prisma", about)
+                .replace("branch: null", &format!("branch: {branch}")),
+        );
+    }
+
+    #[test]
+    fn a_repository_scope_covers_it_the_entities_it_links_to_and_recollections_about_them() {
+        let test = TestBrain::new();
+        let (api, web) = ("repo:github.com/owner/api", "repo:github.com/owner/web");
+        test.put(
+            "entities/repositories/github.com/owner/api.md",
+            &repository(api, &["dep:npm:prisma"]).replace("A repository.", "A shadow repository."),
+        );
+        test.put(
+            "entities/repositories/github.com/owner/web.md",
+            &repository(web, &[]).replace("A repository.", "A shadow repository."),
+        );
+        test.put(
+            "entities/dependencies/npm/prisma.md",
+            "---\nid: dep:npm:prisma\necosystem: npm\nname: prisma\n---\n\nA shadow ORM.\n",
+        );
+        let (about_api, about_prisma, about_web) = (
+            "01JB3K8V9Q0000000000000001",
+            "01JB3K8V9Q0000000000000002",
+            "01JB3K8V9Q0000000000000003",
+        );
+        caveat_about(&test, about_api, api, None);
+        caveat_about(&test, about_prisma, "dep:npm:prisma", None);
+        caveat_about(&test, about_web, web, None);
+        let index = test.index();
+        let mut scoped = query("shadow");
+        scoped.repository = Some(api.into());
+
+        let hits = index.search(&scoped).unwrap();
+        let mut found = ids(&hits);
+        found.sort();
+
+        assert_eq!(found, [about_api, about_prisma, "dep:npm:prisma", api]);
+        assert_eq!(index.search(&query("shadow")).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn recollections_on_other_branches_are_found_only_when_asked_for() {
+        let test = TestBrain::new();
+        let (main, feature) = ("01JB3K8V9Q0000000000000001", "01JB3K8V9Q0000000000000002");
+        caveat_about(&test, main, "dep:npm:prisma", None);
+        caveat_about(&test, feature, "dep:npm:prisma", Some("feature/x"));
+        let index = test.index();
+        let on = |branches: Branches| {
+            let mut query = query("shadow");
+            query.branches = branches;
+            let mut found: Vec<String> = ids(&index.search(&query).unwrap())
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            found.sort();
+            found
+        };
+
+        assert_eq!(on(Branches::Only(vec![])), [main]);
+        assert_eq!(on(Branches::Only(vec!["feature/y".into()])), [main]);
+        assert_eq!(
+            on(Branches::Only(vec!["feature/x".into()])),
+            [main, feature]
+        );
+        assert_eq!(on(Branches::All), [main, feature]);
+    }
+
+    #[test]
+    fn checkouts_are_recorded_and_kept_through_a_rebuild() {
+        let test = TestBrain::new();
+        let mut index = test.index();
+        let api = "repo:github.com/owner/api";
+
+        index.record_checkout(Path::new("/work/api"), api).unwrap();
+        index
+            .record_checkout(Path::new("/work/api-2"), api)
+            .unwrap();
+        index.rebuild(&test.brain, &test.lock()).unwrap();
+
+        assert_eq!(
+            index.checkouts(api).unwrap(),
+            [PathBuf::from("/work/api"), PathBuf::from("/work/api-2")]
+        );
     }
 
     fn ids(hits: &[Hit]) -> Vec<&str> {

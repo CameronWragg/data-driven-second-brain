@@ -12,9 +12,11 @@ use serde::Deserialize;
 use ulid::Ulid;
 
 use crate::brain::Brain;
+use crate::checkout::Checkout;
+use crate::entity::{Doc, Entity, Fields};
 use crate::git::{self, GitError};
 use crate::id::{self, EntityId, ItemId};
-use crate::index::{Index, IndexError, Staged};
+use crate::index::{Index, IndexError, ItemKind, Staged};
 use crate::lock::{LockError, WriteLock};
 use crate::recollection::{self, FrontMatter, Kind, Link, LinkType, Recollection, State};
 
@@ -36,6 +38,12 @@ pub enum Operation {
     Link(LinkChange),
     /// Remove a Link from a Recollection.
     Unlink(LinkChange),
+    /// Create an Entity that neither the server nor the scanner makes, such
+    /// as a Repository not checked out here or a Dependency it doesn't read.
+    CreateEntity(CreateEntity),
+    /// Change an Entity's name, description or `docs`; the server and the
+    /// scanner own its other fields.
+    UpdateEntity(UpdateEntity),
 }
 
 /// The fields of a new Recollection; the server fills in the rest.
@@ -143,6 +151,47 @@ pub struct LinkChange {
     pub unexpected: BTreeMap<String, serde_json::Value>,
 }
 
+/// A new Entity.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CreateEntity {
+    /// `repo:<host>/<owner>/<name>` or `dep:<ecosystem>:<name>`.
+    pub id: String,
+    pub name: String,
+    /// Markdown saying what it is.
+    pub description: Option<String>,
+    /// Where a Dependency's documentation is, by version range.
+    pub docs: Option<Vec<Doc>>,
+    /// A name for the new Entity that later operations in the batch can use
+    /// in place of its ID, as `ref:<name>`.
+    #[serde(rename = "ref")]
+    pub reference: Option<String>,
+    /// Any other field, reported as a problem rather than refused outright,
+    /// so a rejection lists it with every other problem.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub unexpected: BTreeMap<String, serde_json::Value>,
+}
+
+/// The fields of an Entity to change; those left out keep their values.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct UpdateEntity {
+    /// The Entity's ID.
+    pub id: String,
+    /// The `version` you last saw, from `get`, `search` or `write`; the same
+    /// one even if an earlier operation in this batch changes the Entity.
+    pub version: String,
+    pub name: Option<String>,
+    /// Markdown; replaced whole.
+    pub description: Option<String>,
+    /// Replaced whole; only a Dependency has them.
+    pub docs: Option<Vec<Doc>>,
+    /// Any other field, reported as a problem rather than refused outright,
+    /// so a rejection lists it with every other problem.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub unexpected: BTreeMap<String, serde_json::Value>,
+}
+
 /// A Link as an Agent declares it.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -168,6 +217,18 @@ const SERVER_FILLED: [&str; 7] = [
     "abandoned_at",
     "branch",
     "supersedes",
+];
+
+/// The fields of an Entity that belong to the server and the scanner, which
+/// an Agent never sends (SPEC §5.1).
+const ENTITY_SERVER_FILLED: [&str; 7] = [
+    "ecosystem",
+    "default_branch",
+    "forked_from",
+    "components",
+    "branches",
+    "links",
+    "manifest_hashes",
 ];
 
 /// The check a problem failed (SPEC §5.2).
@@ -221,8 +282,8 @@ pub struct Written {
     /// Links to a Recollection the batch removed that stay, because the file
     /// they start from no longer parses.
     pub links_left: Vec<LinkLeft>,
-    /// The new `version` of every Recollection the batch left in place.
-    pub versions: BTreeMap<Ulid, String>,
+    /// The new `version` of every Item the batch left in place.
+    pub versions: BTreeMap<ItemId, String>,
     /// The commit's SHA.
     pub commit: String,
     /// Whether the index took the batch too. If not, the files are still
@@ -247,13 +308,14 @@ pub struct LinkLeft {
     pub to: Ulid,
 }
 
-/// What one operation did, to the Recollection it names: for a supersede,
-/// the replacement.
+/// What one operation did, to the Item it names: for a supersede, the
+/// replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub change: Change,
-    pub id: Ulid,
-    pub kind: Kind,
+    pub id: ItemId,
+    pub kind: ItemKind,
+    /// A Recollection's title or an Entity's name.
     pub title: String,
 }
 
@@ -273,6 +335,11 @@ pub enum Change {
     Deleted,
     Linked(Link),
     Unlinked(Link),
+    /// With the `ref` the new Entity was given, if any.
+    CreatedEntity {
+        reference: Option<String>,
+    },
+    UpdatedEntity,
 }
 
 impl Change {
@@ -285,22 +352,37 @@ impl Change {
             Change::Deleted => "delete",
             Change::Linked(_) => "link",
             Change::Unlinked(_) => "unlink",
+            Change::CreatedEntity { .. } => "create_entity",
+            Change::UpdatedEntity => "update_entity",
+        }
+    }
+
+    /// The verb that starts a commit subject for it.
+    fn verb(&self) -> &'static str {
+        match self {
+            Change::Created { .. } | Change::CreatedEntity { .. } => "Create",
+            Change::Updated | Change::UpdatedEntity => "Update",
+            Change::Superseded { .. } => "Supersede",
+            Change::Deleted => "Delete",
+            Change::Linked(_) => "Link",
+            Change::Unlinked(_) => "Unlink",
         }
     }
 }
 
 /// Checks `operations` and, if every one passes, writes them as one commit
 /// under the write lock, updating `index` to match. `now` is when the batch
-/// is written.
+/// is written, and `checkout` where, if anywhere.
 pub fn write(
     brain: &Brain,
     index: &mut Index,
     operations: Vec<Operation>,
     lock_timeout: Duration,
     now: SystemTime,
+    checkout: Option<&Checkout>,
 ) -> Result<Written, WriteError> {
     let lock = WriteLock::take(brain.root(), lock_timeout)?;
-    let mut batch = Batch::new(brain.root(), now);
+    let mut batch = Batch::new(brain.root(), now, checkout);
     if operations.is_empty() {
         batch.problems.push(Problem {
             index: None,
@@ -317,24 +399,33 @@ pub fn write(
             Operation::Delete(delete) => batch.delete(delete)?,
             Operation::Link(change) => batch.link(change)?,
             Operation::Unlink(change) => batch.unlink(change)?,
+            Operation::CreateEntity(create) => batch.create_entity(create)?,
+            Operation::UpdateEntity(update) => batch.update_entity(update)?,
         }
     }
     if !batch.problems.is_empty() {
         return Err(WriteError::Rejected(batch.problems));
     }
     batch.follow_links(index)?;
-    let message = message(&batch.outcomes, &batch.followed);
+    let message = message(&batch);
     let mut changes = Vec::new();
     let mut versions = BTreeMap::new();
-    for (id, staged) in batch.staged {
-        let after = staged.map(|recollection| recollection.render());
-        if let Some(text) = &after {
-            versions.insert(id, recollection::version(text));
-        }
+    let recollections = batch.staged.into_iter().map(|(id, staged)| {
         let before = batch.disk.remove(&id).flatten();
+        let after = staged.map(|recollection| recollection.render());
+        (ItemId::Recollection(id), before, after)
+    });
+    let entities = batch.staged_entities.into_iter().map(|(id, entity)| {
+        let before = batch.entity_disk.remove(&id).flatten();
+        (ItemId::Entity(id), before, Some(entity.render()))
+    });
+    for (id, before, after) in recollections.chain(entities) {
+        if let Some(text) = &after {
+            versions.insert(id.clone(), recollection::version(text));
+        }
         if before != after {
             changes.push(FileChange {
-                path: id::recollection_file(id),
+                path: id.file(),
                 before,
                 after,
             });
@@ -367,7 +458,15 @@ struct Batch<'a> {
     /// batch deletes it.
     staged: BTreeMap<Ulid, Option<Recollection>>,
     /// The ID each `ref` in the batch so far names.
-    refs: BTreeMap<String, Ulid>,
+    refs: BTreeMap<String, String>,
+    /// The text on disk of each Entity read, or `None` if it has no file.
+    entity_disk: BTreeMap<EntityId, Option<String>>,
+    /// Each Entity the batch creates or changes, with its new content.
+    staged_entities: BTreeMap<EntityId, Entity>,
+    /// The Repository of the Checkout the batch is written in.
+    repository: Option<EntityId>,
+    /// The `branch` new Recollections record (SPEC §5.1).
+    branch: Option<String>,
     /// Each Recollection the batch removes, with the one that replaces it, if
     /// any.
     removed: BTreeMap<Ulid, Option<Ulid>>,
@@ -378,7 +477,7 @@ struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
-    fn new(root: &'a Path, now: SystemTime) -> Batch<'a> {
+    fn new(root: &'a Path, now: SystemTime, checkout: Option<&Checkout>) -> Batch<'a> {
         Batch {
             root,
             now,
@@ -388,6 +487,10 @@ impl<'a> Batch<'a> {
             disk: BTreeMap::new(),
             staged: BTreeMap::new(),
             refs: BTreeMap::new(),
+            entity_disk: BTreeMap::new(),
+            staged_entities: BTreeMap::new(),
+            repository: checkout.map(|checkout| checkout.repository.clone()),
+            branch: checkout.and_then(|checkout| checkout.recorded_branch().map(str::to_owned)),
             removed: BTreeMap::new(),
             outcomes: Vec::new(),
             followed: Vec::new(),
@@ -591,7 +694,7 @@ impl<'a> Batch<'a> {
         let links = self.check_links(&create.links);
         self.check_applies_to(&create.applies_to);
         if let Some(reference) = &create.reference {
-            self.define(reference, id);
+            self.define(reference, id.to_string());
         }
         let recollection = Recollection {
             front_matter: FrontMatter {
@@ -601,7 +704,7 @@ impl<'a> Batch<'a> {
                 summary: create.summary.trim().to_owned(),
                 state: State::Active,
                 abandoned_at: None,
-                branch: None,
+                branch: self.branch.clone(),
                 applies_to: create.applies_to,
                 tags: create.tags,
                 links,
@@ -681,9 +784,165 @@ impl<'a> Batch<'a> {
     fn outcome(&mut self, change: Change, id: Ulid, recollection: &Recollection) {
         self.outcomes.push(Outcome {
             change,
-            id,
-            kind: recollection.front_matter.kind,
+            id: ItemId::Recollection(id),
+            kind: ItemKind::Recollection(recollection.front_matter.kind),
             title: recollection.front_matter.title.clone(),
+        });
+    }
+
+    fn create_entity(&mut self, create: CreateEntity) -> Result<(), WriteError> {
+        let before = self.problems.len();
+        self.check_unexpected("create_entity", &create.unexpected, &ENTITY_SERVER_FILLED);
+        let id = self.entity_id(&create.id);
+        if let Some(id) = &id {
+            if matches!(id, EntityId::Repository { path } if path.starts_with("local/")) {
+                self.schema(format!(
+                    "{id} is a local Repository ID, which only the server gives, to a \
+                     Checkout with no remote"
+                ));
+            } else if self.entity_text(id)?.is_some() || self.staged_entities.contains_key(id) {
+                self.schema(format!(
+                    "{id} already exists; change it with `update_entity`"
+                ));
+            }
+        }
+        self.check_entity_name(&create.name);
+        if let Some(reference) = &create.reference {
+            match &id {
+                Some(id) => self.define(reference, id.to_string()),
+                None => self.define(reference, create.id.clone()),
+            }
+        }
+        let Some(id) = id else {
+            return Ok(());
+        };
+        let mut entity = Entity::new(
+            &id,
+            create.name.trim(),
+            &create.description.unwrap_or_default(),
+        );
+        if let Some(docs) = create.docs {
+            self.set_docs(&mut entity, docs);
+        }
+        if self.problems.len() > before {
+            return Ok(());
+        }
+        self.entity_outcome(
+            Change::CreatedEntity {
+                reference: create.reference,
+            },
+            &id,
+            &entity,
+        );
+        self.staged_entities.insert(id, entity);
+        Ok(())
+    }
+
+    fn update_entity(&mut self, update: UpdateEntity) -> Result<(), WriteError> {
+        let before = self.problems.len();
+        self.check_unexpected("update_entity", &update.unexpected, &ENTITY_SERVER_FILLED);
+        if let Some(name) = &update.name {
+            self.check_entity_name(name);
+        }
+        let Some(id) = self.entity_id(&update.id) else {
+            return Ok(());
+        };
+        let Some(text) = self.entity_text(&id)? else {
+            self.schema(format!("no Entity has the ID {id}"));
+            return Ok(());
+        };
+        let current = recollection::version(&text);
+        if current != update.version {
+            self.problem(
+                Check::Concurrency,
+                format!(
+                    "conflict: {id} has changed since version {}; its current version is {current}",
+                    update.version
+                ),
+            );
+        }
+        let mut entity = match self.staged_entities.get(&id) {
+            Some(entity) => entity.clone(),
+            None => match Entity::parse(&id, &text) {
+                Ok(entity) => entity,
+                Err(error) => {
+                    self.schema(format!(
+                        "{id} can't be changed because its file is broken ({error}); the owner must repair it by hand"
+                    ));
+                    return Ok(());
+                }
+            },
+        };
+        if let Some(name) = update.name {
+            entity.set_name(name.trim().to_owned());
+        }
+        if let Some(description) = update.description {
+            entity.description = description;
+        }
+        if let Some(docs) = update.docs {
+            self.set_docs(&mut entity, docs);
+        }
+        if self.problems.len() > before {
+            return Ok(());
+        }
+        self.entity_outcome(Change::UpdatedEntity, &id, &entity);
+        self.staged_entities.insert(id, entity);
+        Ok(())
+    }
+
+    /// The Entity `id` names, if it names one.
+    fn entity_id(&mut self, id: &str) -> Option<EntityId> {
+        let parsed = EntityId::parse(id);
+        if parsed.is_none() {
+            self.schema(format!(
+                "{id} isn't an Entity ID; give `repo:<host>/<owner>/<name>` or \
+                 `dep:<ecosystem>:<name>`"
+            ));
+        }
+        parsed
+    }
+
+    /// The text on disk of Entity `id`, read once per batch.
+    fn entity_text(&mut self, id: &EntityId) -> Result<Option<String>, WriteError> {
+        if let Some(text) = self.entity_disk.get(id) {
+            return Ok(text.clone());
+        }
+        let path = self.root.join(id.file());
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => return Err(WriteError::Io { path, source }),
+        };
+        self.entity_disk.insert(id.clone(), text.clone());
+        Ok(text)
+    }
+
+    fn check_entity_name(&mut self, name: &str) {
+        if name.trim().is_empty() {
+            self.schema("`name` is empty");
+        } else if name.trim().contains('\n') {
+            self.schema("`name` must be one line");
+        }
+    }
+
+    /// Gives `entity` its `docs`, which only a Dependency has.
+    fn set_docs(&mut self, entity: &mut Entity, docs: Vec<Doc>) {
+        match &mut entity.fields {
+            Fields::Dependency(fields) => fields.docs = docs,
+            Fields::Repository(_) => self.schema("only a Dependency has `docs`"),
+        }
+    }
+
+    /// Records what an operation did to Entity `id`.
+    fn entity_outcome(&mut self, change: Change, id: &EntityId, entity: &Entity) {
+        self.outcomes.push(Outcome {
+            change,
+            id: ItemId::Entity(id.clone()),
+            kind: match entity.fields {
+                Fields::Repository(_) => ItemKind::Repository,
+                Fields::Dependency(_) => ItemKind::Dependency,
+            },
+            title: entity.name().to_owned(),
         });
     }
 
@@ -841,7 +1100,7 @@ impl<'a> Batch<'a> {
     /// canonical form, or anything else as it is. `None` for an unknown ref.
     fn resolve(&self, to: &str) -> Option<String> {
         if let Some(name) = to.strip_prefix("ref:") {
-            return self.refs.get(name).map(Ulid::to_string);
+            return self.refs.get(name).cloned();
         }
         Some(match ItemId::parse(to) {
             Some(ItemId::Recollection(id)) => id.to_string(),
@@ -851,7 +1110,7 @@ impl<'a> Batch<'a> {
 
     /// Gives the new Recollection `id` the name `reference` for the rest of
     /// the batch.
-    fn define(&mut self, reference: &str, id: Ulid) {
+    fn define(&mut self, reference: &str, id: String) {
         if reference.trim().is_empty() {
             self.schema("`ref` is empty");
         } else if self.refs.contains_key(reference) {
@@ -962,7 +1221,7 @@ impl<'a> Batch<'a> {
     /// Checks one Link from a Recollection.
     fn check_link(&mut self, link_type: LinkType, to: &str) {
         let problem = match link_type {
-            LinkType::About if !entity_exists(self.root, to) => Some(format!(
+            LinkType::About if !self.entity_exists(to) => Some(format!(
                 "the `about` Link points at {to}, which isn't a known Entity"
             )),
             LinkType::RelatesTo => match ItemId::parse(to) {
@@ -984,29 +1243,33 @@ impl<'a> Batch<'a> {
 
     fn check_applies_to(&mut self, applies_to: &BTreeMap<String, String>) {
         for entity in applies_to.keys() {
-            if !entity_exists(self.root, entity) {
+            if !self.entity_exists(entity) {
                 self.schema(format!(
                     "`applies_to` names {entity}, which isn't a known Entity"
                 ));
             }
         }
     }
-}
 
-fn entity_exists(root: &Path, id: &str) -> bool {
-    EntityId::parse(id).is_some_and(|id| root.join(id.file()).is_file())
+    /// Whether Entity `id` exists once the batch so far is applied.
+    fn entity_exists(&self, id: &str) -> bool {
+        EntityId::parse(id).is_some_and(|id| {
+            self.staged_entities.contains_key(&id) || self.root.join(id.file()).is_file()
+        })
+    }
 }
 
 /// The commit message for a batch: a generated subject, then trailers (SPEC §5.3).
-fn message(outcomes: &[Outcome], followed: &[Followed]) -> String {
-    let mut ids: Vec<Ulid> = Vec::new();
+fn message(batch: &Batch) -> String {
+    let outcomes = &batch.outcomes;
+    let mut ids: Vec<ItemId> = Vec::new();
     let mut actions: Vec<&str> = Vec::new();
     for outcome in outcomes {
         let old = match outcome.change {
-            Change::Superseded { old, .. } => Some(old),
+            Change::Superseded { old, .. } => Some(ItemId::Recollection(old)),
             _ => None,
         };
-        for id in old.into_iter().chain([outcome.id]) {
+        for id in old.into_iter().chain([outcome.id.clone()]) {
             if !ids.contains(&id) {
                 ids.push(id);
             }
@@ -1015,43 +1278,59 @@ fn message(outcomes: &[Outcome], followed: &[Followed]) -> String {
             actions.push(outcome.change.action());
         }
     }
-    let subject = match (outcomes, ids.len(), actions.as_slice()) {
-        ([one], _, [action]) => {
-            format!("{} {}: {}", verb(action), one.kind.as_str(), one.title)
+    let things = if ids.iter().all(|id| matches!(id, ItemId::Recollection(_))) {
+        "Recollections"
+    } else if ids.iter().all(|id| matches!(id, ItemId::Entity(_))) {
+        "Entities"
+    } else {
+        "Items"
+    };
+    let subject = match (outcomes.as_slice(), ids.len(), actions.as_slice()) {
+        ([one], _, [_]) => {
+            format!("{} {}: {}", one.change.verb(), one.kind.as_str(), one.title)
         }
-        (_, count, [action]) => format!("{} {count} Recollections", verb(action)),
-        (_, count, _) => format!("Change {count} Recollections"),
+        ([first, ..], count, [_]) => format!("{} {count} {things}", first.change.verb()),
+        (_, count, _) => format!("Change {count} {things}"),
     };
     let mut message = format!("{subject}\n\n");
     // Recollections changed only to follow Links are part of the batch too
     // (SPEC §5.1), though the subject names what the operations did.
-    for followed in followed {
-        if !ids.contains(&followed.id) {
-            ids.push(followed.id);
+    for followed in &batch.followed {
+        let id = ItemId::Recollection(followed.id);
+        if !ids.contains(&id) {
+            ids.push(id);
         }
     }
-    for id in &ids {
-        message.push_str(&format!("Recollection: {id}\n"));
+    // The Repository the batch was written in, after any it names.
+    if let Some(repository) = &batch.repository {
+        let id = ItemId::Entity(repository.clone());
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let trailer = |id: &ItemId| match id {
+        ItemId::Recollection(_) => "Recollection",
+        ItemId::Entity(EntityId::Repository { .. }) => "Repository",
+        ItemId::Entity(EntityId::Dependency { .. }) => "Dependency",
+    };
+    for kind in ["Recollection", "Repository", "Dependency"] {
+        for id in ids.iter().filter(|id| trailer(id) == kind) {
+            message.push_str(&format!("{kind}: {id}\n"));
+        }
+    }
+    if let Some(branch) = &batch.branch {
+        message.push_str(&format!("Branch: {branch}\n"));
     }
     message.push_str(&format!("Action: {}\nAuthor: agent\n", actions.join(", ")));
     message
 }
 
-/// An action as the verb that starts a commit subject.
-fn verb(action: &str) -> String {
-    let mut chars = action.chars();
-    chars
-        .next()
-        .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
-        .unwrap_or_default()
-}
-
 /// One file a batch changes, relative to the brain folder: its text before
 /// and after, where `None` means no file.
-struct FileChange {
-    path: PathBuf,
-    before: Option<String>,
-    after: Option<String>,
+pub(crate) struct FileChange {
+    pub(crate) path: PathBuf,
+    pub(crate) before: Option<String>,
+    pub(crate) after: Option<String>,
 }
 
 impl FileChange {
@@ -1064,7 +1343,7 @@ impl FileChange {
 /// them, returning the commit's SHA and whether the index took them. If the
 /// commit fails, the files and index are put back as they were so nothing is
 /// left half-written.
-fn commit(
+pub(crate) fn commit(
     root: &Path,
     index: &mut Index,
     lock: &WriteLock,

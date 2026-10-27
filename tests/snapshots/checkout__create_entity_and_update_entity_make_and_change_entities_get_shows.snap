@@ -1,0 +1,8 @@
+---
+source: tests/checkout.rs
+assertion_line: 302
+expression: created
+---
+0. created dependency dep:npm:zod "zod" (ref z, version [VERSION])
+1. created caveat [ULID] "Zod needs a shadow" (version [VERSION])
+Commit: [SHA]

@@ -1,0 +1,10 @@
+---
+source: tests/checkout.rs
+assertion_line: 46
+expression: "test.git(&brain, &[\"log\", \"-1\", \"--format=%B\"])"
+---
+Create repository: api
+
+Repository: repo:github.com/Owner/api
+Action: create_entity
+Author: server

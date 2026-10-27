@@ -1,0 +1,7 @@
+---
+source: tests/checkout.rs
+assertion_line: 122
+expression: "without.replace(&home, \"[HOME]\")"
+---
+No Checkout is detected: [HOME] isn't inside a git Checkout. `search` covers every Repository.
+To do: if you are working in a Repository, call `context` with `path` set to its folder.
