@@ -712,3 +712,31 @@ async fn every_problem_in_a_batch_of_mixed_operations_is_reported_at_once() {
     );
     client.cancel().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_batch_cannot_delete_a_recollection_it_links_to_or_change_one_by_ref() {
+    let test = TestBrain::new();
+    let client = serving_prisma(&test).await;
+    let (old, version) = create_caveat(&client, "Prisma migrations fail silently").await;
+    let mut linking = prisma_caveat("Prisma needs a shadow database");
+    linking["ref"] = json!("new");
+    linking["links"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "type": "relates-to", "to": old }));
+
+    let (is_error, text) = call(
+        &client,
+        "write",
+        json!({ "operations": [
+            linking,
+            { "op": "delete", "id": old, "version": version },
+            { "op": "update", "id": "ref:new", "version": version, "title": "Renamed" },
+        ] }),
+    )
+    .await;
+
+    assert!(is_error, "{text}");
+    redacted().bind(|| insta::assert_snapshot!(text));
+    client.cancel().await.unwrap();
+}

@@ -387,6 +387,7 @@ impl<'a> Batch<'a> {
         self.check_unexpected("replacement", &replacement.unexpected, &SERVER_FILLED);
         let target = self.target(&supersede.id, &supersede.version)?;
         if let Some((old, _)) = &target {
+            self.check_not_linked_to(*old);
             let old = old.to_string();
             let resolved: Vec<_> = replacement
                 .links
@@ -420,6 +421,9 @@ impl<'a> Batch<'a> {
         let before = self.problems.len();
         self.check_unexpected("delete", &delete.unexpected, &[]);
         let target = self.target(&delete.id, &delete.version)?;
+        if let Some((id, _)) = &target {
+            self.check_not_linked_to(*id);
+        }
         if let Some((id, recollection)) = target
             && self.problems.len() == before
         {
@@ -587,6 +591,7 @@ impl<'a> Batch<'a> {
 
     fn update(&mut self, update: Update) -> Result<(), WriteError> {
         let before = self.problems.len();
+        // An `update` names its Recollection by `id`, which comes first.
         self.check_unexpected("update", &update.unexpected, &SERVER_FILLED[1..]);
         let target = self.target(&update.id, &update.version)?;
         if let Some(title) = &update.title {
@@ -680,6 +685,12 @@ impl<'a> Batch<'a> {
         id: &str,
         version: &str,
     ) -> Result<Option<(Ulid, Recollection)>, WriteError> {
+        if id.starts_with("ref:") {
+            self.schema(format!(
+                "{id} can only name a Link's `to`; give a new Recollection its Links in its own `create`"
+            ));
+            return Ok(None);
+        }
         let ulid = match ItemId::parse(id) {
             Some(ItemId::Recollection(ulid)) => ulid,
             Some(ItemId::Entity(_)) => {
@@ -843,6 +854,25 @@ impl<'a> Batch<'a> {
         }
     }
 
+    /// Checks that no Recollection the batch writes Links to `id`, which an
+    /// operation deletes.
+    fn check_not_linked_to(&mut self, id: Ulid) {
+        let to = id.to_string();
+        let linking: Vec<Ulid> = self
+            .staged
+            .iter()
+            .filter_map(|(from, staged)| {
+                let links = &staged.as_ref()?.front_matter.links;
+                links.iter().any(|link| link.to == to).then_some(*from)
+            })
+            .collect();
+        for from in linking {
+            self.schema(format!(
+                "{from}, which this batch writes, Links to {id}; remove that Link or keep {id}"
+            ));
+        }
+    }
+
     fn check_not_to_itself(&mut self, id: Ulid, links: &[Link]) {
         if links.iter().any(|link| link.to == id.to_string()) {
             self.schema(format!("{id} can't Link to itself"));
@@ -943,7 +973,7 @@ fn commit(root: &Path, changes: &[FileChange], message: &str) -> Result<String, 
         let mut commit = vec!["commit", "--quiet", "--message", message, "--"];
         commit.extend(&paths);
         git::run(root, &commit)?;
-        Ok(git::run(root, &["rev-parse", "HEAD"])?.trim().to_owned())
+        Ok::<_, WriteError>(())
     })();
     if result.is_err() {
         for change in changes {
@@ -953,7 +983,9 @@ fn commit(root: &Path, changes: &[FileChange], message: &str) -> Result<String, 
         reset.extend(&paths);
         let _ = git::run(root, &reset);
     }
-    result
+    result?;
+    // The batch has landed, so a failure from here on must not undo it.
+    Ok(git::run(root, &["rev-parse", "HEAD"])?.trim().to_owned())
 }
 
 /// Writes `text` to `path` under `root`, or removes the file if it's `None`.
