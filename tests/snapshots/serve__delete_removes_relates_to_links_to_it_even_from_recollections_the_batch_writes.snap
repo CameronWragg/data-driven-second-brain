@@ -1,0 +1,9 @@
+---
+source: tests/serve.rs
+expression: written
+---
+0. created caveat [ULID] "Prisma needs a replica too" (version [VERSION])
+1. deleted caveat [ULID] "Prisma migrations fail silently"
+Also updated so their Links follow a removed Recollection:
+- caveat [ULID] "Prisma needs a shadow database" (version [VERSION])
+Commit: [SHA]

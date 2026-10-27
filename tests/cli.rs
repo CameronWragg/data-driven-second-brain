@@ -44,7 +44,6 @@ fn unbuilt_subcommands_fail_and_say_so() {
     for args in [
         &["init"][..],
         &["init", "--path", "/brains/mine"],
-        &["reindex"],
         &["eval"],
         &["hook", "stop"],
     ] {

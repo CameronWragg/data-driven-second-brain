@@ -1,0 +1,7 @@
+---
+source: tests/serve.rs
+expression: text
+---
+rejected: the batch failed its checks, so nothing was written
+- operation 1 (schema): ref:new can only name a Link's `to`; give a new Recollection its Links in its own `create`
+Fix every problem above and send the whole batch again.

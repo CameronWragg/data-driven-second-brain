@@ -44,7 +44,7 @@ There is one binary, `latens`, with these subcommands. The same name is used for
 
 All network steps are best-effort and bounded by `sync.timeout` (§17.1): a failure or timeout counts as offline, and the brain carries on with local data and reports this through `context`.
 
-**Staying up.** Claude Code does not restart a stdio server mid-session, so `serve` exits only on shutdown. Each tool call runs isolated: a panic becomes an `internal` error (§14.6), not a crash. A broken or mismatched index is rebuilt from files. A failed startup step leaves `serve` running and is reported through `context`; tools that need that step say so.
+**Staying up.** Claude Code does not restart a stdio server mid-session, so `serve` exits only on shutdown. Each tool call runs isolated: a panic becomes an `internal` error (§14.6), not a crash. A broken or mismatched index is rebuilt from files. A failed startup step leaves `serve` running and is reported through `context`; tools that need that step say so. Tools that need the index (`search`, `write`) first retry its re-index (step 3.4) if it hasn't yet succeeded, so one failure, such as another writer holding the lock at startup, doesn't last the session. A `write` whose files committed but whose index update failed leaves the index to be re-indexed the same way on the next call.
 
 **Shutdown.** On stdin EOF, `SIGINT`, `SIGTERM` or `SIGHUP` (handled explicitly; rmcp installs no handlers), `serve` stops accepting tool calls, lets a `write` batch that has passed its checks finish its local commit, kills any running `git` network command, releases the lock and exits, within 100 ms. Claude Code sends `SIGTERM` 100 ms after `SIGINT` and `SIGKILL` 400 ms after that, without closing stdin, so shutdown does no network work and nothing depends on it running: the push after each `write` (§10.1) and recovery at startup cover a killed process.
 
@@ -195,6 +195,8 @@ All changes go through the `write` tool as a **batch** of operations. A batch is
 **References within a batch.** A `create` or `create_entity` may carry a local `ref` (e.g. `"a"`), and later operations in the same batch may name it as `ref:a`. The result maps each ref to its new ID.
 
 **Unknown IDs.** A `link` to an ID that doesn't exist is rejected; Entities are created explicitly with `create_entity`.
+
+**Links to a removed Recollection.** When a batch removes a Recollection, every `relates-to` Link to it follows, in the batch's own commit: a `supersede` repoints them at the replacement, and a `delete` removes them. This covers the Recollections the batch already writes and every other one the index's Links table (§6.1) names. A repointed Link that would repeat one its file already has is dropped. Each other Recollection changed this way counts as part of the batch: it gets a `Recollection:` trailer (§5.3) and its new `version` in the result (§14.5), and needs no `version` from the Agent, since the batch reads it under the lock. A file that no longer parses keeps its Link, and the result warns about it for the owner to repair (§10). A Link a hand edit added since the index last saw its file is not followed until the next startup re-indexes it ([ADR-0005](./adr/0005-no-background-processes.md)).
 
 **Optimistic concurrency.** Every Recollection and Entity has a `version`: a hash of its file's content, returned by `get`, `search`, `promotion` and `write`. Operations that change an existing file require the `version` the Agent last saw. If the file has changed since (a hand edit, another `serve`), the operation is rejected with code `conflict` and the current version.
 
@@ -485,7 +487,7 @@ Budgets are constants in code, not owner configuration. They keep every result u
 
 ### 14.5 `write` results
 
-**Success** lists, per operation, an outcome line with any new IDs (and the refs they replace) and the new `version` of every file touched, then warnings (Anchors on uncommitted lines, Anchors relocated, Recollections whose embedded text was truncated), then the commit SHA. A truncation warning names the Recollection and roughly how many characters of the body were embedded, notes that the rest is matched by keyword only, and suggests splitting it (§6.2). The push runs in the background, so there is no push outcome; a `Sync:` line appears only when the last sync didn't succeed (§10.1).
+**Success** lists, per operation, an outcome line with any new IDs (and the refs they replace) and the new `version` of every file touched, then each other Recollection changed so its Links follow a removed one (§5.1) with its new `version`, then warnings (Anchors on uncommitted lines, Anchors relocated, Recollections whose embedded text was truncated, Links left in a file that doesn't parse), then the commit SHA. A truncation warning names the Recollection and roughly how many characters of the body were embedded, notes that the rest is matched by keyword only, and suggests splitting it (§6.2). The push runs in the background, so there is no push outcome; a `Sync:` line appears only when the last sync didn't succeed (§10.1).
 
 **Rejection** lists every problem from §5.2 with its operation index and check, and for duplicates the candidates and decision table.
 
