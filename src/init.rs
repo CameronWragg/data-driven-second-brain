@@ -19,7 +19,7 @@ pub fn run(no_remote: bool, path: Option<PathBuf>) -> anyhow::Result<()> {
         None => config.brain_path.clone(),
     };
     Brain::create(&root)?;
-    if root != config.brain_path {
+    if !config::same_folder(&root, &config.brain_path) {
         config::set_brain_path(&dirs, &root)?;
     }
     print!("{}", connect_text(&root, &std::env::current_exe()?));

@@ -204,7 +204,7 @@ pub fn set_brain_path(dirs: &Dirs, brain_path: &Path) -> Result<(), ConfigError>
                 path: path.clone(),
                 source: source.into(),
             })?;
-    if brain_path == dirs.default_brain_path() {
+    if same_folder(brain_path, &dirs.default_brain_path()) {
         if let Some(brain) = document
             .get_mut("brain")
             .and_then(|item| item.as_table_like_mut())
@@ -225,6 +225,13 @@ pub fn set_brain_path(dirs: &Dirs, brain_path: &Path) -> Result<(), ConfigError>
         std::fs::create_dir_all(dir).map_err(write)?;
     }
     std::fs::write(&path, document.to_string()).map_err(write)
+}
+
+/// Whether two paths name the same folder, following symlinks where the
+/// folders exist (macOS's `/var` is itself a symlink).
+pub(crate) fn same_folder(a: &Path, b: &Path) -> bool {
+    let resolved = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    resolved(a) == resolved(b)
 }
 
 #[cfg(test)]

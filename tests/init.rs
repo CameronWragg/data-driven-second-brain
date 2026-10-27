@@ -79,8 +79,28 @@ fn init_resolves_a_relative_path_against_the_working_directory() {
     assert_success(&test.latens(&["init", "--no-remote", "--path", "brains/mine"]));
 
     let config = Config::load(&test.dirs()).unwrap();
-    assert_eq!(config.brain_path, test.home().join("brains/mine"));
+    assert!(config.brain_path.is_absolute());
     assert!(config.brain_path.join("brain.toml").is_file());
+    // The working directory may be reached through a symlink, as macOS's
+    // /var is, so compare the folders rather than the spellings.
+    assert_eq!(
+        config.brain_path.canonicalize().unwrap(),
+        test.home().join("brains/mine").canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn init_at_the_default_path_through_a_symlink_writes_no_config_file() {
+    let test = TestBrain::new();
+    fs::create_dir_all(test.data_home()).unwrap();
+    let link = test.home().join("data-link");
+    std::os::unix::fs::symlink(test.data_home(), &link).unwrap();
+
+    let path = link.join("latens");
+    assert_success(&test.latens(&["init", "--no-remote", "--path", path.to_str().unwrap()]));
+
+    assert!(test.default_brain().join("brain.toml").is_file());
+    assert!(!test.config_home().exists());
 }
 
 #[test]
