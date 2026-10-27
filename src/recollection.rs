@@ -61,7 +61,7 @@ impl LinkType {
 }
 
 /// A Link, stored in the front-matter of the file it starts from.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Link {
     #[serde(rename = "type")]

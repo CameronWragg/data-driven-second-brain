@@ -1,0 +1,11 @@
+---
+source: tests/serve.rs
+assertion_line: 415
+expression: message
+---
+Supersede caveat: Prisma 5 warns when the shadow database is missing
+
+Recollection: [ULID]
+Recollection: [ULID]
+Action: supersede
+Author: agent

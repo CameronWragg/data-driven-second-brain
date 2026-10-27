@@ -1,0 +1,10 @@
+---
+source: tests/serve.rs
+assertion_line: 439
+expression: message
+---
+Delete caveat: Prisma migrations fail silently
+
+Recollection: [ULID]
+Action: delete
+Author: agent

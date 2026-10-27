@@ -1,0 +1,9 @@
+---
+source: tests/serve.rs
+assertion_line: 476
+expression: "format!(\"{linked}{unlinked}\")"
+---
+0. linked caveat [ULID] "Prisma migrations fail silently" relates-to [ULID] (version [VERSION])
+Commit: [SHA]
+0. unlinked caveat [ULID] "Prisma migrations fail silently" relates-to [ULID] (version [VERSION])
+Commit: [SHA]
