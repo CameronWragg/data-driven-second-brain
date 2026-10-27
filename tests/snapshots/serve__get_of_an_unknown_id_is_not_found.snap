@@ -1,0 +1,7 @@
+---
+source: tests/serve.rs
+assertion_line: 200
+expression: text
+---
+not_found: no Recollection or Entity has the ID 01JB3K8V9Q0000000000000000, dep:npm:nothing
+Check the IDs, or find them with `search`.

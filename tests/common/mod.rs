@@ -7,6 +7,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use rmcp::model::CallToolRequestParams;
+use rmcp::service::RunningService;
+use rmcp::transport::TokioChildProcess;
+use rmcp::{RoleClient, ServiceExt};
+
 /// A fresh tempdir standing in for the owner's machine. `latens` and `git`
 /// run with only the environment set here, so no test can reach the owner's
 /// home, brain, git config or credentials, `gh` login or the network.
@@ -88,6 +93,31 @@ impl TestBrain {
             .expect("latens runs")
     }
 
+    /// Creates a brain with `latens init --no-remote` at the default path.
+    pub fn init(&self) -> PathBuf {
+        assert_success(&self.latens(&["init", "--no-remote"]));
+        self.default_brain()
+    }
+
+    /// Places an Entity file in the brain directly, as a fixture: `path` is
+    /// relative to `entities/`.
+    pub fn place_entity(&self, path: &str, text: &str) {
+        let file = self.default_brain().join("entities").join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, text).unwrap();
+    }
+
+    /// Starts `latens serve` and connects rmcp's client to it over stdio.
+    pub async fn serve(&self) -> RunningService<RoleClient, ()> {
+        let mut command = self.command(env!("CARGO_BIN_EXE_latens"));
+        command.arg("serve");
+        let transport = TokioChildProcess::new(tokio::process::Command::from(command))
+            .expect("latens serve starts");
+        ().serve(transport)
+            .await
+            .expect("the MCP handshake succeeds")
+    }
+
     /// Runs `git` in `dir` and returns its stdout, failing the test if it fails.
     pub fn git(&self, dir: &Path, args: &[&str]) -> String {
         let output = self
@@ -105,6 +135,57 @@ impl TestBrain {
         stdout(&output)
     }
 }
+
+/// Calls `tool` with `arguments`, returning whether it was an error and its text.
+pub async fn call(
+    client: &RunningService<RoleClient, ()>,
+    tool: &'static str,
+    arguments: serde_json::Value,
+) -> (bool, String) {
+    let serde_json::Value::Object(arguments) = arguments else {
+        panic!("tool arguments are an object");
+    };
+    let result = client
+        .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
+        .await
+        .unwrap_or_else(|error| panic!("`{tool}` answers: {error}"));
+    let text = result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text())
+        .map(|text| text.text.as_str())
+        .collect();
+    (result.is_error == Some(true), text)
+}
+
+/// Snapshot settings that redact what changes from run to run: ULIDs,
+/// versions, commit SHAs and timestamps.
+pub fn redacted() -> insta::Settings {
+    let mut settings = insta::Settings::clone_current();
+    for (pattern, replacement) in [
+        (r"\b[0-9A-HJKMNP-TV-Z]{26}\b", "[ULID]"),
+        (r"\b[0-9a-f]{40}\b", "[SHA]"),
+        (r"\b[0-9a-f]{16}\b", "[VERSION]"),
+        (r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", "[TIME]"),
+    ] {
+        settings.add_filter(pattern, replacement);
+    }
+    settings
+}
+
+/// A Dependency Entity file for `dep:npm:prisma`, placed with
+/// `TestBrain::place_entity` at `PRISMA_PATH`.
+pub const PRISMA: &str = "---
+id: dep:npm:prisma
+ecosystem: npm
+name: prisma
+docs: []
+links: []
+---
+
+The Prisma ORM.
+";
+pub const PRISMA_PATH: &str = "dependencies/npm/prisma.md";
 
 pub fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("stdout is UTF-8")
