@@ -83,7 +83,7 @@ pub enum CreateError {
 }
 
 /// The first commit's message (SPEC §5.3).
-const FIRST_COMMIT: &str = "Create the Second Brain\n\nAuthor: server\n";
+const FIRST_COMMIT: &str = "Create the Second Brain\n\nAction: init\nAuthor: server\n";
 
 /// Fills the empty or missing folder `root` with a new brain.
 fn populate(root: &Path, build: Build) -> Result<(), CreateError> {
