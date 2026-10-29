@@ -237,6 +237,14 @@ pub fn prisma_caveat(title: &str) -> serde_json::Value {
     })
 }
 
+/// `text` with `path` replaced by `label`, in its canonical form too, since
+/// macOS reaches the temp folder through `/private`.
+pub fn redact(text: &str, path: &Path, label: &str) -> String {
+    let canonical = path.canonicalize().unwrap().display().to_string();
+    text.replace(&canonical, label)
+        .replace(&path.display().to_string(), label)
+}
+
 /// Snapshot settings that redact what changes from run to run: ULIDs,
 /// versions, commit SHAs and timestamps.
 pub fn redacted() -> insta::Settings {

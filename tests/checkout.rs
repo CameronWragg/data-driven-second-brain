@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{PRISMA, PRISMA_PATH, TestBrain, call, redacted, search_ids};
+use common::{PRISMA, PRISMA_PATH, TestBrain, call, redact, redacted, search_ids};
 use rmcp::RoleClient;
 use rmcp::service::RunningService;
 use serde_json::json;
@@ -21,14 +21,6 @@ async fn context(client: &RunningService<RoleClient, ()>, checkout: &Path) -> St
     let (is_error, text) = call(client, "context", json!({})).await;
     assert!(!is_error, "{text}");
     redact(&text, checkout, "[CHECKOUT]")
-}
-
-/// `text` with `path` replaced by `label`, in its canonical form too, since
-/// macOS reaches the temp folder through `/private`.
-fn redact(text: &str, path: &Path, label: &str) -> String {
-    let canonical = path.canonicalize().unwrap().display().to_string();
-    text.replace(&canonical, label)
-        .replace(&path.display().to_string(), label)
 }
 
 /// The Repository a `context` result names.

@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::{TestBrain, call, prisma_caveat, redacted, search_ids};
+use common::{TestBrain, call, prisma_caveat, redact, redacted, search_ids};
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
 
@@ -148,7 +148,7 @@ async fn a_hand_edit_that_breaks_the_schema_is_searchable_and_listed_for_repair(
     );
     let (is_error, context) = call(&client, "context", json!({})).await;
     assert!(!is_error, "{context}");
-    let context = context.replace(&test.home().display().to_string(), "[HOME]");
+    let context = redact(&context, &test.home(), "[HOME]");
     redacted().bind(|| insta::assert_snapshot!(context));
     assert!(
         test.git(&brain, &["log", "-1", "--format=%B"])

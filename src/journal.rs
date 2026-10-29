@@ -173,7 +173,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::brain::Brain;
 
     const PATH: &str = "recollections/01JB3K8V9Q0000000000000000.md";
     const MESSAGE: &str = "Create caveat: Prisma migrations fail silently\n\n\
@@ -189,13 +188,19 @@ mod tests {
         fn new() -> TestBrain {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("brain");
-            Brain::create(&root).unwrap();
+            fs::create_dir_all(root.join(".index")).unwrap();
+            // A brain's repository made by hand rather than by `init`, so
+            // its first commit has an author where git has no global one.
+            git::run(&root, &["init", "--quiet"]).unwrap();
             for (key, value) in [
                 ("user.name", "Test Owner"),
                 ("user.email", "owner@example.com"),
             ] {
                 git::run(&root, &["config", key, value]).unwrap();
             }
+            fs::write(root.join(".gitignore"), "/.index/\n").unwrap();
+            git::run(&root, &["add", ".gitignore"]).unwrap();
+            git::run(&root, &["commit", "--quiet", "--message", "Start"]).unwrap();
             TestBrain { _dir: dir, root }
         }
 
