@@ -1432,8 +1432,10 @@ fn commit(
         let mut reset = vec!["reset", "--quiet", "--"];
         reset.extend(paths);
         let _ = git::run(root, &reset);
-        // Left behind, it would land a batch the Agent was told failed.
-        journal::clear(root, lock)?;
+        // Left behind, the journal would land a batch the Agent was told
+        // failed. If even deleting it fails, the batch's own error still says
+        // best what went wrong.
+        let _ = journal::clear(root, lock);
     }
     // The batch has landed, so a failure from here on must not undo it; an
     // index left behind is caught up from the files' hashes, and a journal

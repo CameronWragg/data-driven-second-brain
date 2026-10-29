@@ -309,7 +309,7 @@ A second built-in provider, `hash`, needs no model: it feature-hashes the prepro
    Recollections from other Branches are included only if the caller asks (`branches`: a list of names, or `"all"`), and are labelled with their Branch ID. Names are Branches of the Repository in scope; with `scope: "all"` they match that name in every Repository. `scope` is `"current"` (the default), `"all"`, or a Repository ID. With no detected Checkout, `"current"` behaves as `"all"`, and the results say so.
 2. **Filters:** Kind, Entity, tags, and whether to include abandoned Recollections.
 3. **Ranking:** FTS5 and vector results are merged with reciprocal rank fusion.
-4. **Results:** Recollections and Entities, ranked, each with `id`, `kind` (`repository` or `dependency` for Entities), `title`, `summary`, `version`, and `branch` and staleness only when they apply. Scores are not returned; the rank carries the order. The full body comes from `get`.
+4. **Results:** Recollections and Entities, ranked, each with `id`, `kind` (`repository` or `dependency` for Entities, `unknown` for a Recollection whose file is too broken to say, §10), `title`, `summary`, `version`, and `branch` and staleness only when they apply. Scores are not returned; the rank carries the order. The full body comes from `get`.
 
 ## 7. Scanner (the first Source)
 

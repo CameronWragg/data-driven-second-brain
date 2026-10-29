@@ -585,7 +585,7 @@ impl Indexed {
             ItemId::Entity(entity) => match Entity::parse(entity, text) {
                 Ok(parsed) => {
                     if parsed.id() != id.to_string() {
-                        problems.push(format!("its `id` isn't {id}, which its path gives"));
+                        problems.push(wrong_id(id));
                     }
                     Indexed::entity(entity, parsed)
                 }
@@ -724,6 +724,11 @@ fn first_line(error: &recollection::ParseError) -> String {
         .to_owned()
 }
 
+/// The problem of a file whose `id` isn't `id`, the one its path gives.
+fn wrong_id(id: &ItemId) -> String {
+    format!("its `id` isn't {id}, which its path gives")
+}
+
 /// Every way the parsed Recollection `id` fails the schema checks `write`
 /// makes of a file it writes (SPEC §5.2), save those that look at other
 /// files. A body over the size cap is fine in a hand-edited file.
@@ -731,7 +736,7 @@ fn schema_problems(id: &ItemId, recollection: &Recollection) -> Vec<String> {
     let front_matter = &recollection.front_matter;
     let mut problems = Vec::new();
     if front_matter.id != id.to_string() {
-        problems.push(format!("its `id` isn't {id}, which its path gives"));
+        problems.push(wrong_id(id));
     }
     if front_matter.title.trim().is_empty() {
         problems.push("its `title` is empty".to_owned());

@@ -8,32 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::{PRISMA, PRISMA_PATH, TestBrain, call, redacted};
-use rmcp::RoleClient;
+use common::{TestBrain, call, prisma_caveat, redacted, search_ids};
 use rmcp::model::CallToolRequestParams;
-use rmcp::service::RunningService;
 use serde_json::json;
-
-/// A brain holding the Prisma Entity, committed.
-fn brain_with_prisma(test: &TestBrain) -> PathBuf {
-    let brain = test.init();
-    test.place_entity(PRISMA_PATH, PRISMA);
-    test.git(&brain, &["add", "."]);
-    test.git(&brain, &["commit", "--quiet", "--message", "Add Prisma"]);
-    brain
-}
-
-/// A valid `create` operation for a caveat about Prisma.
-fn prisma_caveat(title: &str) -> serde_json::Value {
-    json!({
-        "op": "create",
-        "kind": "caveat",
-        "title": title,
-        "summary": "`prisma migrate dev` exits 0 but applies nothing when SHADOW_DATABASE_URL is unset.",
-        "body": "## Symptom\n\nNo migration runs.\n\n## Cause\n\nNo shadow database.\n\n## Avoidance\n\nSet SHADOW_DATABASE_URL.\n",
-        "links": [{ "type": "about", "to": "dep:npm:prisma" }],
-    })
-}
 
 /// Creates a Prisma caveat titled `title` in its own `serve`, returning the
 /// file it was written to.
@@ -57,16 +34,6 @@ fn id_of(file: &Path) -> String {
     file.file_stem().unwrap().to_str().unwrap().to_owned()
 }
 
-/// The IDs in a `search` result for `query`, in rank order.
-async fn search_ids(client: &RunningService<RoleClient, ()>, query: &str) -> Vec<String> {
-    let (is_error, text) = call(client, "search", json!({ "query": query })).await;
-    assert!(!is_error, "{text}");
-    text.lines()
-        .filter_map(|line| line.split("id=\"").nth(1))
-        .map(|rest| rest.split('"').next().unwrap().to_owned())
-        .collect()
-}
-
 /// Waits up to 10 s for `done`, failing the test if it never is.
 async fn wait_for(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -88,7 +55,7 @@ exit 1
 #[tokio::test]
 async fn a_batch_killed_between_its_journal_and_its_commit_lands_with_its_own_trailers() {
     let test = TestBrain::new();
-    let brain = brain_with_prisma(&test);
+    let brain = test.init_with_prisma();
     let hook = brain.join(".git/hooks/pre-commit");
     fs::create_dir_all(hook.parent().unwrap()).unwrap();
     fs::write(&hook, HOLDING_HOOK).unwrap();
@@ -128,14 +95,17 @@ async fn a_batch_killed_between_its_journal_and_its_commit_lands_with_its_own_tr
     assert!(!brain.join(".index/journal").exists());
     let file = test.git(&brain, &["show", "--name-only", "--format=", "HEAD"]);
     let id = id_of(Path::new(file.trim()));
-    assert_eq!(search_ids(&client, "shadow").await, [id]);
+    assert_eq!(
+        search_ids(&client, json!({ "query": "shadow" })).await,
+        [id]
+    );
     client.cancel().await.unwrap();
 }
 
 #[tokio::test]
 async fn a_file_edited_by_hand_between_sessions_is_committed_as_the_owners_and_re_indexed() {
     let test = TestBrain::new();
-    let brain = brain_with_prisma(&test);
+    let brain = test.init_with_prisma();
     let file = written_caveat(&test, "Prisma migrations fail silently").await;
     let edited = fs::read_to_string(&file)
         .unwrap()
@@ -144,8 +114,14 @@ async fn a_file_edited_by_hand_between_sessions_is_committed_as_the_owners_and_r
 
     let client = test.serve().await;
 
-    assert_eq!(search_ids(&client, "replica").await, [id_of(&file)]);
-    assert_eq!(search_ids(&client, "migration").await, [] as [String; 0]);
+    assert_eq!(
+        search_ids(&client, json!({ "query": "replica" })).await,
+        [id_of(&file)]
+    );
+    assert_eq!(
+        search_ids(&client, json!({ "query": "migration" })).await,
+        [] as [String; 0]
+    );
     let message = test.git(&brain, &["log", "-1", "--format=%B"]);
     redacted().bind(|| insta::assert_snapshot!(message));
     assert!(message.contains(&format!("Recollection: {}", id_of(&file))));
@@ -156,7 +132,7 @@ async fn a_file_edited_by_hand_between_sessions_is_committed_as_the_owners_and_r
 #[tokio::test]
 async fn a_hand_edit_that_breaks_the_schema_is_searchable_and_listed_for_repair() {
     let test = TestBrain::new();
-    let brain = brain_with_prisma(&test);
+    let brain = test.init_with_prisma();
     let file = written_caveat(&test, "Prisma migrations fail silently").await;
     let broken = fs::read_to_string(&file)
         .unwrap()
@@ -166,7 +142,10 @@ async fn a_hand_edit_that_breaks_the_schema_is_searchable_and_listed_for_repair(
 
     let client = test.serve().await;
 
-    assert_eq!(search_ids(&client, "replica").await, [id_of(&file)]);
+    assert_eq!(
+        search_ids(&client, json!({ "query": "replica" })).await,
+        [id_of(&file)]
+    );
     let (is_error, context) = call(&client, "context", json!({})).await;
     assert!(!is_error, "{context}");
     let context = context.replace(&test.home().display().to_string(), "[HOME]");
@@ -181,7 +160,7 @@ async fn a_hand_edit_that_breaks_the_schema_is_searchable_and_listed_for_repair(
 #[tokio::test]
 async fn with_nothing_changed_since_the_last_session_startup_commits_nothing() {
     let test = TestBrain::new();
-    let brain = brain_with_prisma(&test);
+    let brain = test.init_with_prisma();
     written_caveat(&test, "Prisma migrations fail silently").await;
     let head = test.git(&brain, &["rev-parse", "HEAD"]);
 

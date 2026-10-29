@@ -99,6 +99,15 @@ impl TestBrain {
         self.default_brain()
     }
 
+    /// Creates a brain like `init`, holding the Prisma Entity, committed.
+    pub fn init_with_prisma(&self) -> PathBuf {
+        let brain = self.init();
+        self.place_entity(PRISMA_PATH, PRISMA);
+        self.git(&brain, &["add", "."]);
+        self.git(&brain, &["commit", "--quiet", "--message", "Add Prisma"]);
+        brain
+    }
+
     /// Places an Entity file in the brain directly, as a fixture: `path` is
     /// relative to `entities/`.
     pub fn place_entity(&self, path: &str, text: &str) {
@@ -200,6 +209,32 @@ pub async fn call(
         .map(|text| text.text.as_str())
         .collect();
     (result.is_error == Some(true), text)
+}
+
+/// The IDs in a `search` result for `arguments`, in rank order.
+pub async fn search_ids(
+    client: &RunningService<RoleClient, ()>,
+    arguments: serde_json::Value,
+) -> Vec<String> {
+    let (is_error, text) = call(client, "search", arguments).await;
+    assert!(!is_error, "{text}");
+    text.lines()
+        .filter_map(|line| line.split("id=\"").nth(1))
+        .map(|rest| rest.split('"').next().unwrap().to_owned())
+        .collect()
+}
+
+/// A valid `create` operation for a caveat about Prisma.
+pub fn prisma_caveat(title: &str) -> serde_json::Value {
+    serde_json::json!({
+        "op": "create",
+        "kind": "caveat",
+        "title": title,
+        "summary": "`prisma migrate dev` exits 0 but applies nothing when SHADOW_DATABASE_URL is unset.",
+        "body": "## Symptom\n\nNo migration runs.\n\n## Cause\n\nNo shadow database.\n\n## Avoidance\n\nSet SHADOW_DATABASE_URL.\n",
+        "links": [{ "type": "about", "to": "dep:npm:prisma" }],
+        "tags": ["migrations"],
+    })
 }
 
 /// Snapshot settings that redact what changes from run to run: ULIDs,

@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{PRISMA, PRISMA_PATH, TestBrain, call, redacted};
+use common::{PRISMA, PRISMA_PATH, TestBrain, call, redacted, search_ids};
 use rmcp::RoleClient;
 use rmcp::service::RunningService;
 use serde_json::json;
@@ -156,19 +156,6 @@ async fn write_ok(
     let (is_error, text) = call(client, "write", json!({ "operations": operations })).await;
     assert!(!is_error, "{text}");
     text
-}
-
-/// The IDs in a `search` result, in rank order.
-async fn search_ids(
-    client: &RunningService<RoleClient, ()>,
-    arguments: serde_json::Value,
-) -> Vec<String> {
-    let (is_error, text) = call(client, "search", arguments).await;
-    assert!(!is_error, "{text}");
-    text.split("id=\"")
-        .skip(1)
-        .map(|rest| rest.split('"').next().unwrap().to_owned())
-        .collect()
 }
 
 #[tokio::test]
