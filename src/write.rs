@@ -1410,6 +1410,10 @@ fn commit(
     changes: &[FileChange],
     message: &str,
 ) -> Result<(String, bool), WriteError> {
+    // A journal is taken as landed once HEAD moves past its parent, so no
+    // commit may land on top of one that hasn't: whatever commits, the
+    // server's own commits too, rolls it forward first.
+    journal::roll_forward(root, lock)?;
     let parent = git::run(root, &["rev-parse", "HEAD"])?;
     Journal::new(
         parent.trim(),
