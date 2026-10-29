@@ -17,6 +17,7 @@ use crate::entity::{Doc, Entity, Fields};
 use crate::git::{self, GitError};
 use crate::id::{self, EntityId, ItemId, ItemKind};
 use crate::index::{Index, IndexError, Staged};
+use crate::journal::{self, Journal, JournalError};
 use crate::lock::{LockError, WriteLock};
 use crate::recollection::{self, FrontMatter, Kind, Link, LinkType, Recollection, State};
 
@@ -269,6 +270,8 @@ pub enum WriteError {
     Git(#[from] GitError),
     #[error(transparent)]
     Index(#[from] IndexError),
+    #[error(transparent)]
+    Journal(#[from] JournalError),
 }
 
 /// A committed batch.
@@ -382,6 +385,11 @@ pub fn write(
     checkout: Option<&Checkout>,
 ) -> Result<Written, WriteError> {
     let lock = WriteLock::take(brain.root(), lock_timeout)?;
+    // A batch a killed `serve` left half-done lands first, so this one is
+    // checked against it (SPEC §5.3).
+    if journal::roll_forward(brain.root(), &lock)? {
+        index.refresh(brain, &lock)?;
+    }
     let mut batch = Batch::new(brain.root(), now, checkout);
     if operations.is_empty() {
         batch.problems.push(Problem {
@@ -1342,16 +1350,7 @@ fn message(batch: &Batch) -> String {
             ids.push(id);
         }
     }
-    let trailer = |id: &ItemId| match id {
-        ItemId::Recollection(_) => "Recollection",
-        ItemId::Entity(EntityId::Repository { .. }) => "Repository",
-        ItemId::Entity(EntityId::Dependency { .. }) => "Dependency",
-    };
-    for kind in ["Recollection", "Repository", "Dependency"] {
-        for id in ids.iter().filter(|id| trailer(id) == kind) {
-            message.push_str(&format!("{kind}: {id}\n"));
-        }
-    }
+    message.push_str(&item_trailers(&ids));
     let branch = batch
         .checkout
         .as_ref()
@@ -1365,6 +1364,23 @@ fn message(batch: &Batch) -> String {
         batch.author.as_str()
     ));
     message
+}
+
+/// A trailer naming each of `ids` (SPEC §5.3), Recollections first, then
+/// Repositories, then Dependencies, each in the order given.
+pub(crate) fn item_trailers(ids: &[ItemId]) -> String {
+    let trailer = |id: &ItemId| match id {
+        ItemId::Recollection(_) => "Recollection",
+        ItemId::Entity(EntityId::Repository { .. }) => "Repository",
+        ItemId::Entity(EntityId::Dependency { .. }) => "Dependency",
+    };
+    let mut trailers = String::new();
+    for kind in ["Recollection", "Repository", "Dependency"] {
+        for id in ids.iter().filter(|id| trailer(id) == kind) {
+            trailers.push_str(&format!("{kind}: {id}\n"));
+        }
+    }
+    trailers
 }
 
 /// One file a batch changes, relative to the brain folder: its text before
@@ -1382,9 +1398,11 @@ impl FileChange {
 }
 
 /// Applies `changes`, to the files and then the index, and commits exactly
-/// them, returning the commit's SHA and whether the index took them. If the
-/// commit fails, the files and index are put back as they were so nothing is
-/// left half-written.
+/// them, returning the commit's SHA and whether the index took them. The
+/// write journal holds them first, so a kill part-way is rolled forward at
+/// the next start (SPEC §5.3). If the commit fails, the files and index are
+/// put back as they were and the journal is deleted, so nothing is left
+/// half-written.
 fn commit(
     root: &Path,
     index: &mut Index,
@@ -1392,6 +1410,15 @@ fn commit(
     changes: &[FileChange],
     message: &str,
 ) -> Result<(String, bool), WriteError> {
+    let parent = git::run(root, &["rev-parse", "HEAD"])?;
+    Journal::new(
+        parent.trim(),
+        message,
+        changes
+            .iter()
+            .map(|change| (change.path_str(), change.after.as_deref())),
+    )
+    .record(root, lock)?;
     let paths: Vec<&str> = changes.iter().map(FileChange::path_str).collect();
     let result = apply(root, index, lock, changes, message);
     if result.is_err() {
@@ -1401,10 +1428,14 @@ fn commit(
         let mut reset = vec!["reset", "--quiet", "--"];
         reset.extend(paths);
         let _ = git::run(root, &reset);
+        // Left behind, it would land a batch the Agent was told failed.
+        journal::clear(root, lock)?;
     }
     // The batch has landed, so a failure from here on must not undo it; an
-    // index left behind is caught up from the files' hashes.
+    // index left behind is caught up from the files' hashes, and a journal
+    // left behind is a no-op once HEAD has moved past its parent.
     let indexed = result?.commit().is_ok();
+    let _ = journal::clear(root, lock);
     let sha = git::run(root, &["rev-parse", "HEAD"])?.trim().to_owned();
     Ok((sha, indexed))
 }
@@ -1441,21 +1472,8 @@ fn apply<'a>(
 
 /// Writes `text` to `path` under `root`, or removes the file if it's `None`.
 fn put(root: &Path, path: &Path, text: Option<&str>) -> Result<(), WriteError> {
-    let full = root.join(path);
-    let io = |source| WriteError::Io {
-        path: full.clone(),
+    journal::put(root, path, text).map_err(|source| WriteError::Io {
+        path: root.join(path),
         source,
-    };
-    match text {
-        Some(text) => {
-            if let Some(dir) = full.parent() {
-                std::fs::create_dir_all(dir).map_err(io)?;
-            }
-            std::fs::write(&full, text).map_err(io)
-        }
-        None => match std::fs::remove_file(&full) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(io(error)),
-            _ => Ok(()),
-        },
-    }
+    })
 }

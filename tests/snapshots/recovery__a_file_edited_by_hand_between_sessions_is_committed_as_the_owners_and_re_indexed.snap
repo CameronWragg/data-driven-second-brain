@@ -1,0 +1,10 @@
+---
+source: tests/recovery.rs
+assertion_line: 150
+expression: message
+---
+Commit hand edits to 1 file
+
+Recollection: [ULID]
+Action: hand-edit
+Author: owner

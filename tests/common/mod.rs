@@ -127,13 +127,24 @@ impl TestBrain {
         self.serve_with(command).await
     }
 
-    async fn serve_with(&self, mut command: Command) -> RunningService<RoleClient, ()> {
+    async fn serve_with(&self, command: Command) -> RunningService<RoleClient, ()> {
+        self.serve_with_pid(command).await.0
+    }
+
+    /// Starts `latens serve`, returning its process ID too, so a test can
+    /// kill it.
+    pub async fn serve_killable(&self) -> (RunningService<RoleClient, ()>, u32) {
+        self.serve_with_pid(self.command(env!("CARGO_BIN_EXE_latens")))
+            .await
+    }
+
+    async fn serve_with_pid(&self, mut command: Command) -> (RunningService<RoleClient, ()>, u32) {
         command.arg("serve");
         let transport = TokioChildProcess::new(tokio::process::Command::from(command))
             .expect("latens serve starts");
-        ().serve(transport)
-            .await
-            .expect("the MCP handshake succeeds")
+        let pid = transport.id().expect("latens serve is running");
+        let client = ().serve(transport).await.expect("the MCP handshake succeeds");
+        (client, pid)
     }
 
     /// Makes a Checkout named `name` outside the brain, with one commit on

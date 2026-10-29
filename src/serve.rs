@@ -22,9 +22,10 @@ use crate::config::{Config, Dirs};
 use crate::get::{self, Found};
 use crate::id::ItemKind;
 use crate::id::{EntityId, ItemId};
-use crate::index::{Branches, Hit, Index, Query};
+use crate::index::{Branches, Hit, Index, Query, Repair};
 use crate::lock::{self, LockError, WriteLock};
 use crate::recollection::{Kind, Link};
+use crate::recover;
 use crate::write::{self, Change, Check, Operation, WriteError, Written};
 
 /// The server instructions (SPEC §14.7), which Claude Code cuts at 4,096
@@ -46,6 +47,9 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// About how many characters a `context` result may hold (SPEC §14.4).
 const CONTEXT_BUDGET: usize = 4_000;
+
+/// How many files needing repair `context` names before "+N more".
+const CONTEXT_REPAIRS: usize = 10;
 
 /// What ends a `context` result cut to fit its budget.
 const CONTEXT_CUT: &str = "\n[truncated to stay within the size budget]\n";
@@ -72,10 +76,12 @@ pub fn run() -> anyhow::Result<()> {
         current: Arc::new(AtomicBool::new(false)),
     };
     let place = Arc::new(Mutex::new(Place::default()));
+    let recovery = Arc::new(Mutex::new(None));
     let server = Server {
         brain,
         start: start.clone(),
         place: place.clone(),
+        recovery: recovery.clone(),
         startup,
         startup_timeout: config.startup_timeout.unwrap_or(STARTUP_TIMEOUT),
         indexing: indexing.clone(),
@@ -87,6 +93,12 @@ pub fn run() -> anyhow::Result<()> {
         .block_on(async {
             // Alongside the handshake, which never waits for it (SPEC §2).
             tokio::task::spawn_blocking(move || {
+                // A failure is reported by `context`. `write` rolls a journal
+                // left behind forward itself, and hand edits wait for the next
+                // start.
+                if let Err(error) = recover::recover(indexing.brain.root(), lock_timeout) {
+                    *lock_ignoring_poison(&recovery) = Some(error.to_string());
+                }
                 // A failure is reported by the first tool that needs the index,
                 // which tries again.
                 let _ = indexing.current();
@@ -175,7 +187,13 @@ impl Place {
 /// Locks `place`. A panic while it was held can't leave a `Place`
 /// half-written, so a poisoned lock is taken as it is.
 fn lock_place(place: &Mutex<Place>) -> std::sync::MutexGuard<'_, Place> {
-    place
+    lock_ignoring_poison(place)
+}
+
+/// Locks `mutex`, whose value a panic can't leave half-written, taking a
+/// poisoned lock as it is.
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -218,6 +236,8 @@ struct Server {
     /// starts from.
     start: PathBuf,
     place: Arc<Mutex<Place>>,
+    /// Why startup recovery (SPEC §2 step 2) failed, if it did.
+    recovery: Arc<Mutex<Option<String>>>,
     /// Whether the startup sequence has finished.
     startup: watch::Receiver<bool>,
     startup_timeout: Duration,
@@ -387,7 +407,7 @@ impl Server {
             return error.result();
         }
         let (place, indexing) = (self.place.clone(), self.indexing.clone());
-        let start = self.start.clone();
+        let (start, recovery) = (self.start.clone(), self.recovery.clone());
         blocking(move || {
             // A `path` that can't be read keeps the Checkout found before.
             let mut unreadable = None;
@@ -401,7 +421,20 @@ impl Server {
             if let Place::InCheckout { checkout, .. } = &mut place {
                 checkout.refresh_branch();
             }
-            Ok(render_context(&indexing.brain, &place, unreadable))
+            let repairs = indexing
+                .current()
+                .ok()
+                .and_then(|index| index.needing_repair().ok());
+            let recovery = lock_ignoring_poison(&recovery).clone();
+            Ok(render_context(
+                &indexing.brain,
+                &place,
+                Problems {
+                    unreadable,
+                    recovery,
+                    repairs,
+                },
+            ))
         })
         .await
     }
@@ -638,9 +671,9 @@ fn render_search(header: &str, hits: &[Hit]) -> String {
 
 /// One result on one line, its stored text inside `untrusted` delimiters.
 fn hit_line(hit: &Hit) -> String {
-    let tag = match hit.kind {
-        ItemKind::Recollection(_) => "recollection",
-        ItemKind::Repository | ItemKind::Dependency => "entity",
+    let tag = match ItemId::parse(&hit.id) {
+        Some(ItemId::Entity(_)) => "entity",
+        _ => "recollection",
     };
     let branch = match &hit.branch {
         Some(branch) => format!(" branch=\"{}\"", attribute(branch)),
@@ -651,14 +684,24 @@ fn hit_line(hit: &Hit) -> String {
     format!(
         "<{tag} id=\"{}\" kind=\"{}\" version=\"{}\"{branch} untrusted>{line}</{tag}>",
         hit.id,
-        hit.kind.as_str(),
+        hit.kind.map_or("unknown", ItemKind::as_str),
         hit.version,
     )
 }
 
-/// Renders where this `serve` works, then a to-do line, within the budget.
-/// `unreadable` says why a `path` just given couldn't be read.
-fn render_context(brain: &Brain, place: &Place, unreadable: Option<String>) -> String {
+/// What `context` reports besides where this `serve` works.
+struct Problems {
+    /// Why a `path` just given couldn't be read.
+    unreadable: Option<String>,
+    /// Why startup recovery failed.
+    recovery: Option<String>,
+    /// The files needing repair, or `None` if the index couldn't say.
+    repairs: Option<Vec<Repair>>,
+}
+
+/// Renders where this `serve` works and what needs attention, then a to-do
+/// line, within the budget.
+fn render_context(brain: &Brain, place: &Place, problems: Problems) -> String {
     let mut text = String::new();
     let mut to_do = Vec::new();
     match place {
@@ -712,9 +755,35 @@ fn render_context(brain: &Brain, place: &Place, unreadable: Option<String>) -> S
         }
         Place::Unknown => text.push_str("The startup sequence hasn't looked for a Checkout.\n"),
     }
-    if let Some(why) = unreadable {
+    if let Some(why) = problems.unreadable {
         text.push_str(&format!("Problem: {why}; nothing above changed.\n"));
         to_do.push("call `context` again with a folder inside the Checkout".to_owned());
+    }
+    if let Some(why) = problems.recovery {
+        text.push_str(&format!(
+            "Problem: startup couldn't commit what an earlier session or the owner left \
+             uncommitted: {why}\n"
+        ));
+        to_do.push("tell the owner startup recovery failed".to_owned());
+    }
+    match problems.repairs.as_deref() {
+        None => {
+            text.push_str("The index couldn't be read, so files needing repair aren't listed.\n")
+        }
+        Some([]) => {}
+        Some(repairs) => {
+            text.push_str(&format!(
+                "Files needing repair by hand in {}; `search` still finds them as they are:\n",
+                brain.root().display()
+            ));
+            for repair in repairs.iter().take(CONTEXT_REPAIRS) {
+                text.push_str(&format!("- {}: {}\n", repair.path, repair.problem));
+            }
+            if repairs.len() > CONTEXT_REPAIRS {
+                text.push_str(&format!("+{} more\n", repairs.len() - CONTEXT_REPAIRS));
+            }
+            to_do.push("ask the owner to repair the files listed above".to_owned());
+        }
     }
     let to_do = match to_do.as_slice() {
         [] => "nothing".to_owned(),

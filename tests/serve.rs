@@ -125,6 +125,8 @@ async fn a_batch_with_an_invalid_operation_writes_nothing_and_reports_every_prob
     let test = TestBrain::new();
     let brain = test.init();
     test.place_entity(PRISMA_PATH, PRISMA);
+    test.git(&brain, &["add", "."]);
+    test.git(&brain, &["commit", "--quiet", "--message", "Add Prisma"]);
     let client = test.serve().await;
 
     let (is_error, text) = call(
@@ -158,7 +160,7 @@ async fn a_batch_with_an_invalid_operation_writes_nothing_and_reports_every_prob
     assert!(is_error, "{text}");
     assert!(text.starts_with("rejected:"), "{text}");
     insta::assert_snapshot!(text);
-    assert_eq!(test.git(&brain, &["rev-list", "--count", "HEAD"]), "1\n");
+    assert_eq!(test.git(&brain, &["rev-list", "--count", "HEAD"]), "2\n");
     assert_eq!(
         fs::read_dir(brain.join("recollections")).unwrap().count(),
         0
@@ -913,31 +915,6 @@ async fn search_ids(
         .filter_map(|line| line.split("id=\"").nth(1))
         .map(|rest| rest.split('"').next().unwrap().to_owned())
         .collect()
-}
-
-#[tokio::test]
-async fn a_file_edited_on_disk_is_re_indexed_when_serve_restarts() {
-    let test = TestBrain::new();
-    let client = serving_prisma(&test).await;
-    let (id, _) = create_caveat(&client, "Prisma migrations fail silently").await;
-    client.cancel().await.unwrap();
-    let file = recollection_file(&test, &id);
-    let edited = fs::read_to_string(&file)
-        .unwrap()
-        .replace("No migration runs.", "No replica runs.");
-    fs::write(&file, edited).unwrap();
-
-    let client = test.serve().await;
-
-    assert_eq!(
-        search_ids(&client, json!({ "query": "replica" })).await,
-        [id]
-    );
-    assert_eq!(
-        search_ids(&client, json!({ "query": "migration" })).await,
-        [] as [String; 0]
-    );
-    client.cancel().await.unwrap();
 }
 
 #[tokio::test]
