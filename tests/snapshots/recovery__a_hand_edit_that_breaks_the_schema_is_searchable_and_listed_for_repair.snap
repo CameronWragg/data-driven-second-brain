@@ -1,0 +1,9 @@
+---
+source: tests/recovery.rs
+assertion_line: 173
+expression: context
+---
+No Checkout is detected: [HOME] isn't inside a git Checkout. `search` covers every Repository.
+Files needing repair by hand in [HOME]/.local/share/latens; `search` still finds them as they are:
+- recollections/[ULID].md: its front-matter is invalid: error: line 5 column 1: unknown field `priority`, expected one of id, kind, title, summary, state, abandoned_at, branch, applies_to, tags, links, supersedes, created, updated
+To do: if you are working in a Repository, call `context` with `path` set to its folder; ask the owner to repair the files listed above.

@@ -1,0 +1,10 @@
+---
+source: tests/recovery.rs
+assertion_line: 124
+expression: message
+---
+Create caveat: Prisma migrations fail silently
+
+Recollection: [ULID]
+Action: create
+Author: agent

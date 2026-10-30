@@ -183,6 +183,14 @@ impl Entity {
         }
     }
 
+    /// The ID its front-matter gives.
+    pub fn id(&self) -> &str {
+        match &self.fields {
+            Fields::Repository(fields) => &fields.id,
+            Fields::Dependency(fields) => &fields.id,
+        }
+    }
+
     /// What the Entity is called.
     pub fn name(&self) -> &str {
         match &self.fields {

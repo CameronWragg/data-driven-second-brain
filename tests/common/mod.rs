@@ -99,6 +99,15 @@ impl TestBrain {
         self.default_brain()
     }
 
+    /// Creates a brain like `init`, holding the Prisma Entity, committed.
+    pub fn init_with_prisma(&self) -> PathBuf {
+        let brain = self.init();
+        self.place_entity(PRISMA_PATH, PRISMA);
+        self.git(&brain, &["add", "."]);
+        self.git(&brain, &["commit", "--quiet", "--message", "Add Prisma"]);
+        brain
+    }
+
     /// Places an Entity file in the brain directly, as a fixture: `path` is
     /// relative to `entities/`.
     pub fn place_entity(&self, path: &str, text: &str) {
@@ -127,13 +136,24 @@ impl TestBrain {
         self.serve_with(command).await
     }
 
-    async fn serve_with(&self, mut command: Command) -> RunningService<RoleClient, ()> {
+    async fn serve_with(&self, command: Command) -> RunningService<RoleClient, ()> {
+        self.serve_with_pid(command).await.0
+    }
+
+    /// Starts `latens serve`, returning its process ID too, so a test can
+    /// kill it.
+    pub async fn serve_killable(&self) -> (RunningService<RoleClient, ()>, u32) {
+        self.serve_with_pid(self.command(env!("CARGO_BIN_EXE_latens")))
+            .await
+    }
+
+    async fn serve_with_pid(&self, mut command: Command) -> (RunningService<RoleClient, ()>, u32) {
         command.arg("serve");
         let transport = TokioChildProcess::new(tokio::process::Command::from(command))
             .expect("latens serve starts");
-        ().serve(transport)
-            .await
-            .expect("the MCP handshake succeeds")
+        let pid = transport.id().expect("latens serve is running");
+        let client = ().serve(transport).await.expect("the MCP handshake succeeds");
+        (client, pid)
     }
 
     /// Makes a Checkout named `name` outside the brain, with one commit on
@@ -189,6 +209,40 @@ pub async fn call(
         .map(|text| text.text.as_str())
         .collect();
     (result.is_error == Some(true), text)
+}
+
+/// The IDs in a `search` result for `arguments`, in rank order.
+pub async fn search_ids(
+    client: &RunningService<RoleClient, ()>,
+    arguments: serde_json::Value,
+) -> Vec<String> {
+    let (is_error, text) = call(client, "search", arguments).await;
+    assert!(!is_error, "{text}");
+    text.lines()
+        .filter_map(|line| line.split("id=\"").nth(1))
+        .map(|rest| rest.split('"').next().unwrap().to_owned())
+        .collect()
+}
+
+/// A valid `create` operation for a caveat about Prisma.
+pub fn prisma_caveat(title: &str) -> serde_json::Value {
+    serde_json::json!({
+        "op": "create",
+        "kind": "caveat",
+        "title": title,
+        "summary": "`prisma migrate dev` exits 0 but applies nothing when SHADOW_DATABASE_URL is unset.",
+        "body": "## Symptom\n\nNo migration runs.\n\n## Cause\n\nNo shadow database.\n\n## Avoidance\n\nSet SHADOW_DATABASE_URL.\n",
+        "links": [{ "type": "about", "to": "dep:npm:prisma" }],
+        "tags": ["migrations"],
+    })
+}
+
+/// `text` with `path` replaced by `label`, in its canonical form too, since
+/// macOS reaches the temp folder through `/private`.
+pub fn redact(text: &str, path: &Path, label: &str) -> String {
+    let canonical = path.canonicalize().unwrap().display().to_string();
+    text.replace(&canonical, label)
+        .replace(&path.display().to_string(), label)
 }
 
 /// Snapshot settings that redact what changes from run to run: ULIDs,

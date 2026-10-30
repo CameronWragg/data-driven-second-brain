@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{PRISMA, PRISMA_PATH, TestBrain, call, redacted};
+use common::{PRISMA, PRISMA_PATH, TestBrain, call, redact, redacted, search_ids};
 use rmcp::RoleClient;
 use rmcp::service::RunningService;
 use serde_json::json;
@@ -21,14 +21,6 @@ async fn context(client: &RunningService<RoleClient, ()>, checkout: &Path) -> St
     let (is_error, text) = call(client, "context", json!({})).await;
     assert!(!is_error, "{text}");
     redact(&text, checkout, "[CHECKOUT]")
-}
-
-/// `text` with `path` replaced by `label`, in its canonical form too, since
-/// macOS reaches the temp folder through `/private`.
-fn redact(text: &str, path: &Path, label: &str) -> String {
-    let canonical = path.canonicalize().unwrap().display().to_string();
-    text.replace(&canonical, label)
-        .replace(&path.display().to_string(), label)
 }
 
 /// The Repository a `context` result names.
@@ -156,19 +148,6 @@ async fn write_ok(
     let (is_error, text) = call(client, "write", json!({ "operations": operations })).await;
     assert!(!is_error, "{text}");
     text
-}
-
-/// The IDs in a `search` result, in rank order.
-async fn search_ids(
-    client: &RunningService<RoleClient, ()>,
-    arguments: serde_json::Value,
-) -> Vec<String> {
-    let (is_error, text) = call(client, "search", arguments).await;
-    assert!(!is_error, "{text}");
-    text.split("id=\"")
-        .skip(1)
-        .map(|rest| rest.split('"').next().unwrap().to_owned())
-        .collect()
 }
 
 #[tokio::test]

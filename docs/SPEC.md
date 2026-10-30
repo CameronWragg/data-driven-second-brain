@@ -238,6 +238,8 @@ Author: agent
 
 `Author` is `agent` for a `write` batch, `owner` for hand edits committed at startup (§10), and `server` for commits the binary makes on its own: `init`'s first commit (§12), scanner changes, deleting abandoned Recollections, and migrations (§17.3).
 
+`Action` says what a commit did, for `history` (§14.1): the operations (§5.1) it carried out, in the order they first appear, whether a `write` batch or the server made them; `init` for `init`'s first commit (§12); `hand-edit` for hand edits (§10); and `migrate` for a migration (§17.3).
+
 **The write journal.** A batch must commit whole even if `serve` is killed part-way. Under the lock, before touching any file, `serve` writes `.index/journal` holding the full new content of every file, the paths to delete and the commit message, and fsyncs it. It then writes the files, updates the index, commits, and deletes the journal. A journal found at startup (§2) is rolled forward: every file is rewritten from it and committed with its message. Replaying is idempotent, so the batch lands exactly as the Agent was told it did, with its own `Author` and trailers rather than as an owner hand edit.
 
 A successful batch starts a push in the background (§10.1); the `write` result doesn't wait for it.
@@ -307,7 +309,7 @@ A second built-in provider, `hash`, needs no model: it feature-hashes the prepro
    Recollections from other Branches are included only if the caller asks (`branches`: a list of names, or `"all"`), and are labelled with their Branch ID. Names are Branches of the Repository in scope; with `scope: "all"` they match that name in every Repository. `scope` is `"current"` (the default), `"all"`, or a Repository ID. With no detected Checkout, `"current"` behaves as `"all"`, and the results say so.
 2. **Filters:** Kind, Entity, tags, and whether to include abandoned Recollections.
 3. **Ranking:** FTS5 and vector results are merged with reciprocal rank fusion.
-4. **Results:** Recollections and Entities, ranked, each with `id`, `kind` (`repository` or `dependency` for Entities), `title`, `summary`, `version`, and `branch` and staleness only when they apply. Scores are not returned; the rank carries the order. The full body comes from `get`.
+4. **Results:** Recollections and Entities, ranked, each with `id`, `kind` (`repository` or `dependency` for Entities, `unknown` for a Recollection whose file is too broken to say, §10), `title`, `summary`, `version`, and `branch` and staleness only when they apply. Scores are not returned; the rank carries the order. The full body comes from `get`.
 
 ## 7. Scanner (the first Source)
 
@@ -393,7 +395,7 @@ The Promotion is complete once no `active` Recollections remain on the merged Br
 - The brain uses the system `git` command, so the owner's existing git credentials apply.
 - Each batch is one commit (§5). Pushes happen in the background after every successful `write` batch, at startup (to catch anything a killed process left unpushed), and on an explicit `push`. There is no push at shutdown and no timer.
 - **The remote** is the brain repository's own `origin`, never a configuration key. A brain with no remote (`latens init --no-remote`, §12) is a normal state: pulls and pushes are skipped, and `context` reports "no remote" as status rather than as a sync problem.
-- **Hand edits:** uncommitted changes found at startup are committed with `Author: owner`. A file that fails the schema checks (§5) is still indexed as-is, and `context` lists it as needing repair. Hand-edited and pulled files are scanned for secrets on their way into the index (§5.4).
+- **Hand edits:** uncommitted changes found at startup, after the write journal is replayed (§5.3), are committed together in one commit with the subject `Commit hand edits to N files`, a `Recollection:`, `Repository:` or `Dependency:` trailer for each Item file changed, `Action: hand-edit` and `Author: owner`. A file that fails the schema checks (§5) is still indexed as-is, and `context` lists it as needing repair. Hand-edited and pulled files are scanned for secrets on their way into the index (§5.4).
 
 ### 10.1 The sync sequence
 

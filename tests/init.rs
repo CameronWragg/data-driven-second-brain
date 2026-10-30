@@ -46,7 +46,10 @@ fn init_makes_one_commit_that_git_ignores_the_index() {
     assert_eq!(test.git(&brain, &["status", "--porcelain"]), "");
     assert_eq!(test.git(&brain, &["ls-files"]), ".gitignore\nbrain.toml\n");
     let message = test.git(&brain, &["log", "-1", "--format=%B"]);
-    assert!(message.contains("Author: server"), "{message}");
+    assert!(
+        message.ends_with("Action: init\nAuthor: server\n\n"),
+        "{message:?}"
+    );
 }
 
 #[test]

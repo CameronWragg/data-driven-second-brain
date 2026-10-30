@@ -4,7 +4,7 @@ mod common;
 
 use std::fs;
 
-use common::{PRISMA, PRISMA_PATH, TestBrain, call, redacted};
+use common::{PRISMA, PRISMA_PATH, TestBrain, call, prisma_caveat, redacted, search_ids};
 use rmcp::RoleClient;
 use rmcp::service::RunningService;
 use serde_json::json;
@@ -70,19 +70,6 @@ async fn tools_list_registers_all_eight_tools_with_their_annotations() {
     client.cancel().await.unwrap();
 }
 
-/// A valid `create` operation for a caveat about Prisma.
-fn prisma_caveat(title: &str) -> serde_json::Value {
-    json!({
-        "op": "create",
-        "kind": "caveat",
-        "title": title,
-        "summary": "`prisma migrate dev` exits 0 but applies nothing when SHADOW_DATABASE_URL is unset.",
-        "body": "## Symptom\n\nNo migration runs.\n\n## Cause\n\nNo shadow database.\n\n## Avoidance\n\nSet SHADOW_DATABASE_URL.\n",
-        "links": [{ "type": "about", "to": "dep:npm:prisma" }],
-        "tags": ["migrations"],
-    })
-}
-
 #[tokio::test]
 async fn a_valid_create_batch_writes_one_file_each_in_one_agent_commit() {
     let test = TestBrain::new();
@@ -125,6 +112,8 @@ async fn a_batch_with_an_invalid_operation_writes_nothing_and_reports_every_prob
     let test = TestBrain::new();
     let brain = test.init();
     test.place_entity(PRISMA_PATH, PRISMA);
+    test.git(&brain, &["add", "."]);
+    test.git(&brain, &["commit", "--quiet", "--message", "Add Prisma"]);
     let client = test.serve().await;
 
     let (is_error, text) = call(
@@ -158,7 +147,7 @@ async fn a_batch_with_an_invalid_operation_writes_nothing_and_reports_every_prob
     assert!(is_error, "{text}");
     assert!(text.starts_with("rejected:"), "{text}");
     insta::assert_snapshot!(text);
-    assert_eq!(test.git(&brain, &["rev-list", "--count", "HEAD"]), "1\n");
+    assert_eq!(test.git(&brain, &["rev-list", "--count", "HEAD"]), "2\n");
     assert_eq!(
         fs::read_dir(brain.join("recollections")).unwrap().count(),
         0
@@ -314,10 +303,7 @@ async fn write_returns_busy_when_the_lock_stays_held_past_lock_timeout() {
 /// A brain holding the Prisma Entity, committed, with `latens serve`
 /// connected to it.
 async fn serving_prisma(test: &TestBrain) -> RunningService<RoleClient, ()> {
-    let brain = test.init();
-    test.place_entity(PRISMA_PATH, PRISMA);
-    test.git(&brain, &["add", "."]);
-    test.git(&brain, &["commit", "--quiet", "--message", "Add Prisma"]);
+    test.init_with_prisma();
     test.serve().await
 }
 
@@ -899,44 +885,6 @@ async fn search_finds_a_written_recollection_by_a_body_word_and_by_a_split_ident
     redacted().bind(|| insta::assert_snapshot!(text));
     let (_, by_word) = call(&client, "search", json!({ "query": "user" })).await;
     assert!(by_word.contains(&id), "{by_word}");
-    client.cancel().await.unwrap();
-}
-
-/// The IDs in a `search` result for `arguments`, in rank order.
-async fn search_ids(
-    client: &RunningService<RoleClient, ()>,
-    arguments: serde_json::Value,
-) -> Vec<String> {
-    let (is_error, text) = call(client, "search", arguments).await;
-    assert!(!is_error, "{text}");
-    text.lines()
-        .filter_map(|line| line.split("id=\"").nth(1))
-        .map(|rest| rest.split('"').next().unwrap().to_owned())
-        .collect()
-}
-
-#[tokio::test]
-async fn a_file_edited_on_disk_is_re_indexed_when_serve_restarts() {
-    let test = TestBrain::new();
-    let client = serving_prisma(&test).await;
-    let (id, _) = create_caveat(&client, "Prisma migrations fail silently").await;
-    client.cancel().await.unwrap();
-    let file = recollection_file(&test, &id);
-    let edited = fs::read_to_string(&file)
-        .unwrap()
-        .replace("No migration runs.", "No replica runs.");
-    fs::write(&file, edited).unwrap();
-
-    let client = test.serve().await;
-
-    assert_eq!(
-        search_ids(&client, json!({ "query": "replica" })).await,
-        [id]
-    );
-    assert_eq!(
-        search_ids(&client, json!({ "query": "migration" })).await,
-        [] as [String; 0]
-    );
     client.cancel().await.unwrap();
 }
 

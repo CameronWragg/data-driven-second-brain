@@ -56,7 +56,8 @@ pub enum Branches {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
     pub id: String,
-    pub kind: ItemKind,
+    /// `None` for a Recollection whose file is too broken to say.
+    pub kind: Option<ItemKind>,
     pub title: String,
     pub summary: String,
     pub version: String,
@@ -76,6 +77,16 @@ pub struct Refreshed {
     pub removed: Vec<PathBuf>,
 }
 
+/// A file that fails the schema, which is indexed as it is until the owner
+/// repairs it by hand (SPEC §10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repair {
+    /// Relative to the brain folder.
+    pub path: String,
+    /// What is wrong with it.
+    pub problem: String,
+}
+
 /// Why the index couldn't be read or updated.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -87,16 +98,16 @@ pub enum IndexError {
 
 /// The index schema this binary builds. Any change to `SCHEMA` bumps it: an
 /// index built at another version is rebuilt, never migrated.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
-CREATE TABLE files (path TEXT PRIMARY KEY, hash TEXT NOT NULL) STRICT;
+CREATE TABLE files (path TEXT PRIMARY KEY, hash TEXT NOT NULL, problem TEXT) STRICT;
 CREATE TABLE items (
     row INTEGER PRIMARY KEY,
     id TEXT NOT NULL UNIQUE,
     path TEXT NOT NULL UNIQUE REFERENCES files (path),
-    kind TEXT NOT NULL,
+    kind TEXT,
     title TEXT NOT NULL,
     summary TEXT NOT NULL,
     state TEXT NOT NULL,
@@ -279,6 +290,22 @@ impl Index {
         Ok((hits, total))
     }
 
+    /// The files that fail the schema, by path.
+    pub fn needing_repair(&self) -> Result<Vec<Repair>, IndexError> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT path, problem FROM files WHERE problem IS NOT NULL ORDER BY path",
+        )?;
+        let repairs = statement
+            .query_map([], |row| {
+                Ok(Repair {
+                    path: row.get(0)?,
+                    problem: row.get(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(repairs)
+    }
+
     /// Records that a Checkout of `repository` is at `path` on this machine
     /// (SPEC §4.3).
     pub fn record_checkout(
@@ -318,10 +345,10 @@ impl Index {
 /// A result from a row whose first six columns are an Item's ID, kind,
 /// title, summary, version and branch.
 fn hit(row: &rusqlite::Row) -> rusqlite::Result<Hit> {
-    let kind: String = row.get(1)?;
+    let kind: Option<String> = row.get(1)?;
     Ok(Hit {
         id: row.get(0)?,
-        kind: ItemKind::parse(&kind).expect("the index stores only known kinds"),
+        kind: kind.map(|kind| ItemKind::parse(&kind).expect("the index stores only known kinds")),
         title: row.get(2)?,
         summary: row.get(3)?,
         version: row.get(4)?,
@@ -462,8 +489,9 @@ fn item_files(root: &Path) -> Result<Vec<String>, IndexError> {
 }
 
 /// Replaces whatever the index holds for the Item file at `path` with
-/// `text`, or drops it if `text` is `None`. A file too broken to parse keeps
-/// its hash, so it isn't read again until it changes, but can't be found.
+/// `text`, or drops it if `text` is `None`. A file that fails the schema is
+/// indexed as it is, with what is wrong with it, so it can still be found
+/// and is listed for repair (SPEC §10).
 fn put(transaction: &Transaction, path: &str, text: Option<&str>) -> Result<(), IndexError> {
     let id = ItemId::from_file(path).expect("only Item files are indexed");
     let id_text = id.to_string();
@@ -478,20 +506,19 @@ fn put(transaction: &Transaction, path: &str, text: Option<&str>) -> Result<(), 
     let Some(text) = text else {
         return Ok(());
     };
+    let (indexed, problems) = Indexed::read(&id, text);
+    let problem = (!problems.is_empty()).then(|| problems.join("; "));
     transaction.execute(
-        "INSERT INTO files (path, hash) VALUES (?1, ?2)",
-        [path, &recollection::version(text)],
+        "INSERT INTO files (path, hash, problem) VALUES (?1, ?2, ?3)",
+        params![path, recollection::version(text), problem],
     )?;
-    let Some(indexed) = Indexed::read(&id, text) else {
-        return Ok(());
-    };
     transaction.execute(
         "INSERT INTO items (id, path, kind, title, summary, state, branch)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             id_text,
             path,
-            indexed.kind.as_str(),
+            indexed.kind.map(ItemKind::as_str),
             indexed.title,
             indexed.summary,
             indexed.state.as_str(),
@@ -521,7 +548,8 @@ fn put(transaction: &Transaction, path: &str, text: Option<&str>) -> Result<(), 
 
 /// What the index holds about one Item, read from its file.
 struct Indexed {
-    kind: ItemKind,
+    /// `None` for a Recollection whose file is too broken to say.
+    kind: Option<ItemKind>,
     title: String,
     summary: String,
     state: State,
@@ -539,64 +567,196 @@ struct IndexedLink {
 }
 
 impl Indexed {
-    /// Reads the file of Item `id`, or `None` if it doesn't parse.
-    fn read(id: &ItemId, text: &str) -> Option<Indexed> {
-        match id {
-            ItemId::Recollection(_) => {
-                let Recollection { front_matter, body } = Recollection::parse(text).ok()?;
-                let text = format!(
-                    "{}\n{}\n{}",
-                    front_matter.summary,
-                    front_matter.tags.join(" "),
-                    body
-                );
-                Some(Indexed {
-                    kind: ItemKind::Recollection(front_matter.kind),
-                    title: front_matter.title,
-                    summary: front_matter.summary,
-                    state: front_matter.state,
-                    branch: front_matter.branch,
-                    tags: front_matter.tags,
-                    links: front_matter
-                        .links
-                        .into_iter()
-                        .map(|link| IndexedLink {
-                            link_type: link.link_type,
-                            to: link.to,
-                        })
-                        .collect(),
-                    text,
-                })
-            }
-            ItemId::Entity(entity) => {
-                let parsed = Entity::parse(entity, text).ok()?;
-                let body = parsed.description.as_str();
-                let first_line = body.lines().map(str::trim).find(|line| !line.is_empty());
-                let mut summary: String = first_line.unwrap_or_default().to_owned();
-                if summary.chars().count() > ENTITY_SUMMARY {
-                    summary = summary.chars().take(ENTITY_SUMMARY - 1).collect();
-                    summary.push('…');
+    /// Reads the file of Item `id`, with every way it fails the schema. A
+    /// file that doesn't parse gives what can be salvaged from it.
+    fn read(id: &ItemId, text: &str) -> (Indexed, Vec<String>) {
+        let mut problems = Vec::new();
+        let indexed = match id {
+            ItemId::Recollection(_) => match Recollection::parse(text) {
+                Ok(recollection) => {
+                    problems = schema_problems(id, &recollection);
+                    Indexed::recollection(recollection)
                 }
-                Some(Indexed {
-                    kind: entity.kind(),
-                    title: parsed.name().to_owned(),
-                    summary,
-                    state: State::Active,
-                    branch: None,
-                    tags: Vec::new(),
-                    links: parsed
-                        .links()
-                        .iter()
-                        .map(|link| IndexedLink {
-                            link_type: link.link_type,
-                            to: link.to.clone(),
-                        })
-                        .collect(),
-                    text: body.to_owned(),
+                Err(error) => {
+                    problems.push(first_line(&error));
+                    Indexed::salvaged(id, None, text)
+                }
+            },
+            ItemId::Entity(entity) => match Entity::parse(entity, text) {
+                Ok(parsed) => {
+                    if parsed.id() != id.to_string() {
+                        problems.push(wrong_id(id));
+                    }
+                    Indexed::entity(entity, parsed)
+                }
+                Err(error) => {
+                    problems.push(first_line(&error));
+                    Indexed::salvaged(id, Some(entity.kind()), text)
+                }
+            },
+        };
+        (indexed, problems)
+    }
+
+    fn recollection(recollection: Recollection) -> Indexed {
+        let Recollection { front_matter, body } = recollection;
+        let text = format!(
+            "{}\n{}\n{}",
+            front_matter.summary,
+            front_matter.tags.join(" "),
+            body
+        );
+        Indexed {
+            kind: Some(ItemKind::Recollection(front_matter.kind)),
+            title: front_matter.title,
+            summary: front_matter.summary,
+            state: front_matter.state,
+            branch: front_matter.branch,
+            tags: front_matter.tags,
+            links: front_matter
+                .links
+                .into_iter()
+                .map(|link| IndexedLink {
+                    link_type: link.link_type,
+                    to: link.to,
                 })
-            }
+                .collect(),
+            text,
         }
     }
+
+    fn entity(id: &EntityId, parsed: Entity) -> Indexed {
+        let body = parsed.description.as_str();
+        let first_line = body.lines().map(str::trim).find(|line| !line.is_empty());
+        let mut summary: String = first_line.unwrap_or_default().to_owned();
+        if summary.chars().count() > ENTITY_SUMMARY {
+            summary = summary.chars().take(ENTITY_SUMMARY - 1).collect();
+            summary.push('…');
+        }
+        Indexed {
+            kind: Some(id.kind()),
+            title: parsed.name().to_owned(),
+            summary,
+            state: State::Active,
+            branch: None,
+            tags: Vec::new(),
+            links: parsed
+                .links()
+                .iter()
+                .map(|link| IndexedLink {
+                    link_type: link.link_type,
+                    to: link.to.clone(),
+                })
+                .collect(),
+            text: body.to_owned(),
+        }
+    }
+
+    /// What can be read of the file `text` of Item `id`, which doesn't parse:
+    /// any front-matter field that still reads as YAML of the right shape,
+    /// and the whole text to search. `kind` is the Item's kind if its ID
+    /// gives it.
+    fn salvaged(id: &ItemId, kind: Option<ItemKind>, text: &str) -> Indexed {
+        let fields: serde_json::Map<String, serde_json::Value> =
+            recollection::split_front_matter(text)
+                .and_then(|(yaml, _)| serde_saphyr::from_str(yaml).ok())
+                .unwrap_or_default();
+        let string = |key: &str| {
+            fields
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        let kind = kind.or_else(|| {
+            string("kind")
+                .and_then(|kind| ItemKind::parse(&kind))
+                .filter(|kind| matches!(kind, ItemKind::Recollection(_)))
+        });
+        let title_key = if matches!(id, ItemId::Entity(_)) {
+            "name"
+        } else {
+            "title"
+        };
+        let list = |key: &str| {
+            fields
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        Indexed {
+            kind,
+            title: string(title_key).unwrap_or_else(|| id.to_string()),
+            summary: string("summary").unwrap_or_default(),
+            state: match string("state").as_deref() {
+                Some("abandoned") => State::Abandoned,
+                _ => State::Active,
+            },
+            branch: string("branch"),
+            tags: list("tags")
+                .into_iter()
+                .filter_map(|tag| tag.as_str().map(str::to_owned))
+                .collect(),
+            links: list("links")
+                .into_iter()
+                .filter_map(|link| {
+                    Some(IndexedLink {
+                        link_type: serde_json::from_value(link.get("type")?.clone()).ok()?,
+                        to: link.get("to")?.as_str()?.to_owned(),
+                    })
+                })
+                .collect(),
+            text: text.to_owned(),
+        }
+    }
+}
+
+/// The first line of `error`, without the excerpt of the file a YAML error
+/// adds below it, so a list of files needing repair stays short.
+fn first_line(error: &recollection::ParseError) -> String {
+    error
+        .to_string()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The problem of a file whose `id` isn't `id`, the one its path gives.
+fn wrong_id(id: &ItemId) -> String {
+    format!("its `id` isn't {id}, which its path gives")
+}
+
+/// Every way the parsed Recollection `id` fails the schema checks `write`
+/// makes of a file it writes (SPEC §5.2), save those that look at other
+/// files. A body over the size cap is fine in a hand-edited file.
+fn schema_problems(id: &ItemId, recollection: &Recollection) -> Vec<String> {
+    let front_matter = &recollection.front_matter;
+    let mut problems = Vec::new();
+    if front_matter.id != id.to_string() {
+        problems.push(wrong_id(id));
+    }
+    if front_matter.title.trim().is_empty() {
+        problems.push("its `title` is empty".to_owned());
+    }
+    if front_matter.summary.trim().is_empty() {
+        problems.push("its `summary` is empty".to_owned());
+    } else if front_matter.summary.trim().contains('\n') {
+        problems.push("its `summary` isn't one line".to_owned());
+    }
+    if !front_matter
+        .links
+        .iter()
+        .any(|link| link.link_type == LinkType::About)
+    {
+        problems.push("it has no `about` Link".to_owned());
+    }
+    for section in recollection::missing_sections(front_matter.kind, &recollection.body) {
+        problems.push(format!("its body has no `## {section}` section"));
+    }
+    problems
 }
 
 /// An FTS5 query matching any word of `text`, each as written and split at
@@ -856,7 +1016,7 @@ updated: 2026-10-23T10:00:00Z
             hits,
             [Hit {
                 id: CAVEAT_ID.into(),
-                kind: ItemKind::Recollection(Kind::Caveat),
+                kind: Some(ItemKind::Recollection(Kind::Caveat)),
                 title: "Prisma migrations fail silently".into(),
                 summary: "Nothing applies without a shadow database.".into(),
                 version: crate::recollection::version(&caveat(
@@ -1058,7 +1218,7 @@ updated: 2026-10-23T10:00:00Z
             ),
             (
                 "dep:npm:prisma",
-                ItemKind::Dependency,
+                Some(ItemKind::Dependency),
                 "prisma",
                 "The Prisma ORM."
             )
@@ -1066,18 +1226,85 @@ updated: 2026-10-23T10:00:00Z
     }
 
     #[test]
-    fn a_file_that_doesnt_parse_is_not_found_and_not_read_again_until_it_changes() {
+    fn a_file_that_doesnt_parse_is_found_listed_for_repair_and_not_read_again_until_it_changes() {
         let test = TestBrain::new();
-        test.put(CAVEAT_PATH, "no front-matter, shadow\n");
+        // A key this binary doesn't know fails strict parsing (SPEC §17.2).
+        let broken =
+            caveat("The shadow database is missing.").replace("state: active", "priority: high");
+        test.put(CAVEAT_PATH, &broken);
         let mut index = test.index();
 
-        assert_eq!(
-            ids(&index.search(&query("shadow")).unwrap()),
-            [] as [&str; 0]
+        let hits = index.search(&query("shadow")).unwrap();
+        assert_eq!(ids(&hits), [CAVEAT_ID]);
+        assert_eq!(hits[0].title, "Prisma migrations fail silently");
+        assert_eq!(hits[0].kind, Some(ItemKind::Recollection(Kind::Caveat)));
+        let repairs = index.needing_repair().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, CAVEAT_PATH);
+        assert!(
+            repairs[0].problem.contains("front-matter is invalid"),
+            "{:?}",
+            repairs[0]
         );
         assert_eq!(
             index.refresh(&test.brain, &test.lock()).unwrap(),
             Refreshed::default()
         );
+    }
+
+    #[test]
+    fn a_file_without_front_matter_is_found_by_its_text_with_its_id_as_its_title() {
+        let test = TestBrain::new();
+        test.put(CAVEAT_PATH, "no front-matter, shadow\n");
+        let index = test.index();
+
+        let hits = index.search(&query("shadow")).unwrap();
+
+        assert_eq!(ids(&hits), [CAVEAT_ID]);
+        assert_eq!(hits[0].title, CAVEAT_ID);
+        assert_eq!(hits[0].kind, None);
+        assert_eq!(index.needing_repair().unwrap()[0].path, CAVEAT_PATH);
+    }
+
+    #[test]
+    fn a_recollection_that_parses_but_fails_the_schema_is_listed_for_repair() {
+        let test = TestBrain::new();
+        test.put(CAVEAT_PATH, &caveat("## Symptom\n\nNothing applies.\n"));
+        let index = test.index();
+
+        let repairs = index.needing_repair().unwrap();
+
+        assert_eq!(ids(&index.search(&query("applies")).unwrap()), [CAVEAT_ID]);
+        assert_eq!(repairs.len(), 1);
+        assert!(
+            repairs[0].problem.contains("`## Cause`"),
+            "{:?}",
+            repairs[0]
+        );
+        assert!(
+            repairs[0].problem.contains("`## Avoidance`"),
+            "{:?}",
+            repairs[0]
+        );
+    }
+
+    #[test]
+    fn a_valid_file_needs_no_repair() {
+        let test = TestBrain::new();
+        test.put(
+            CAVEAT_PATH,
+            &caveat("## Symptom\n\nA.\n\n## Cause\n\nB.\n\n## Avoidance\n\nC.\n"),
+        );
+        test.put(
+            "entities/dependencies/npm/prisma.md",
+            &crate::entity::Entity::new(
+                &EntityId::parse("dep:npm:prisma").unwrap(),
+                "prisma",
+                "The Prisma ORM.",
+            )
+            .render(),
+        );
+
+        assert_eq!(test.index().needing_repair().unwrap(), []);
     }
 }
